@@ -416,7 +416,10 @@ def telegram_webhook():
                     f"{accounting_context}\n\n"
                     "IMPORTANT: You have full access to George's invoice and accounting data above. "
                     "Always answer directly using that data — never say you don't have access. "
-                    "Search the invoice list for vendor names, amounts, dates. "
+                    "When searching for vendors, use PARTIAL matching — if the user says 'hadco', "
+                    "match any vendor containing 'hadco' like 'Hadco Foods'. "
+                    "If user says 'more vino' match 'MoreVino' or 'MoreVino/MoreSushi'. "
+                    "Always search case-insensitively and match partial names. "
                     "Use TTD for currency. Be concise and specific."
                 }]
             )
