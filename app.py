@@ -350,6 +350,24 @@ def telegram_webhook():
             app.pending_drafts.pop(chat_id)
             send_message(chat_id, "❌ Email discarded.")
 
+        # ── Clear sheet via assistant — no confirmation loop, just do it ──
+        elif any(phrase in text_l for phrase in ["clear the sheet","clear sheet","delete all invoices",
+                                                  "delete all entries","start fresh","start over",
+                                                  "wipe the sheet","reset the sheet","clear all data"]):
+            send_message(chat_id, "🗑 Clearing all invoice data now...")
+            try:
+                if ACCOUNTING_API_URL:
+                    r    = requests.post(f"{ACCOUNTING_API_URL}/api/clearsheet", timeout=15)
+                    data = r.json()
+                    if data.get("status") == "ok":
+                        send_message(chat_id, "✅ All sheets cleared! Ready for a fresh start. Next invoice will be INV-001.")
+                    else:
+                        send_message(chat_id, f"❌ Error: {data.get('message','unknown error')}")
+                else:
+                    send_message(chat_id, "⚠️ Accounting API URL not configured.")
+            except Exception as e:
+                send_message(chat_id, f"❌ Error: {str(e)[:100]}")
+
         # ── Accounting summary ────────────────────────────────────────────
         elif text_l in ("/accounting","accounting","expenses","spending"):
             if ACCOUNTING_API_URL:
