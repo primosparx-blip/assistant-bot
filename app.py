@@ -76,6 +76,131 @@ def get_unread_emails(max_results=5):
         })
     return emails
 
+def get_email_body(service, msg_id):
+    """Fetch full email body text."""
+    try:
+        detail = service.users().messages().get(
+            userId="me", id=msg_id, format="full"
+        ).execute()
+        payload = detail.get("payload", {})
+        
+        def extract_text(part):
+            if part.get("mimeType") == "text/plain":
+                data = part.get("body", {}).get("data", "")
+                if data:
+                    import base64
+                    return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+            for sub in part.get("parts", []):
+                result = extract_text(sub)
+                if result:
+                    return result
+            return ""
+        
+        return extract_text(payload)[:3000]
+    except:
+        return ""
+
+def scan_emails_for_receipts(days=10):
+    """Scan Gmail for receipts and invoices from the past N days."""
+    service = get_gmail_service()
+    
+    # Search for receipt/invoice emails
+    query = "subject:(receipt OR invoice OR payment OR order confirmation OR booking) newer_than:" + str(days) + "d"
+    
+    results = service.users().messages().list(
+        userId="me", q=query, maxResults=20
+    ).execute()
+    
+    messages = results.get("messages", [])
+    receipts = []
+    
+    for msg in messages:
+        try:
+            detail  = service.users().messages().get(
+                userId="me", id=msg["id"], format="metadata",
+                metadataHeaders=["From","Subject","Date"]
+            ).execute()
+            headers = {h["name"]:h["value"] for h in detail["payload"]["headers"]}
+            body    = get_email_body(service, msg["id"])
+            
+            receipts.append({
+                "id":      msg["id"],
+                "from":    headers.get("From",""),
+                "subject": headers.get("Subject",""),
+                "date":    headers.get("Date",""),
+                "body":    body
+            })
+        except:
+            pass
+    
+    return receipts
+
+def extract_invoice_from_email(email):
+    """Use Claude to extract invoice data from email content."""
+    email_text = (
+        "From: " + email["from"] + " Subject: " + email["subject"] +
+        " Date: " + email["date"] + " Body: " + email["body"][:2000]
+    )
+    instruction = (
+        "You are an accounting AI. Extract invoice/receipt data from this email. "
+        + email_text +
+        " Return ONLY valid JSON or the word SKIP if not a receipt: "
+        '{"vendor":"Company name","invoice_date":"YYYY-MM-DD","invoice_number":"ref or N/A",'
+        '"description":"brief description","category":"Food & Entertainment or Travel or '
+        'Software/Cloud or Utilities or Professional Services or Other",'
+        '"currency":"TTD","amount":0.00,"tax":0.00,"confidence":"high or medium or low"}'
+    )
+    resp = claude.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=300,
+        messages=[{"role": "user", "content": instruction}]
+    )
+    raw = resp.content[0].text.strip()
+    if raw.upper().startswith("SKIP") or raw == "":
+        return None
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    try:
+        return json.loads(raw)
+    except:
+        return None
+
+def scan_and_log_receipts(days=10):
+    """Scan emails, extract receipts, log to accounting bot, return summary."""
+    emails   = scan_emails_for_receipts(days)
+    logged   = []
+    skipped  = 0
+
+    for email in emails:
+        data = extract_invoice_from_email(email)
+        if not data:
+            skipped += 1
+            continue
+        # Log to accounting bot
+        try:
+            if ACCOUNTING_API_URL:
+                resp = requests.post(
+                    ACCOUNTING_API_URL + "/api/log_invoice",
+                    json={"data": data, "source": "email_scan"},
+                    timeout=15
+                )
+                result = resp.json()
+                if result.get("status") == "ok":
+                    logged.append({
+                        "vendor":  data.get("vendor","Unknown"),
+                        "amount":  data.get("amount",0),
+                        "total":   round(float(data.get("amount",0)) + float(data.get("tax",0)), 2),
+                        "inv_id":  result.get("inv_id",""),
+                        "subject": email["subject"][:50]
+                    })
+        except Exception as e:
+            print("Log error: " + str(e))
+
+    return {"logged": logged, "skipped": skipped, "total_scanned": len(emails)}
+
+
 def send_email(to, subject, body):
     service  = get_gmail_service()
     message  = MIMEText(body)
@@ -354,6 +479,14 @@ def morning_scheduler():
         if now.hour == 12 and now.minute < 5 and OWNER_CHAT_ID and last_sent != date:
             try:
                 print("Sending morning briefing at " + str(now))
+                # Scan emails for overnight receipts
+                try:
+                    scan_result = scan_and_log_receipts(1)  # last 24 hours only
+                    if scan_result["logged"]:
+                        vendors = ", ".join([i["vendor"] for i in scan_result["logged"][:5]])
+                        send_message(OWNER_CHAT_ID, "Auto-logged " + str(len(scan_result["logged"])) + " receipt(s) from email: " + vendors, parse_mode="")
+                except Exception as se:
+                    print("Email scan error: " + str(se))
                 briefing = get_full_briefing()
                 send_message(OWNER_CHAT_ID, briefing, parse_mode="")
                 last_sent = date
@@ -524,6 +657,29 @@ def telegram_webhook():
                     }]
                 )
                 send_message(chat_id, resp.content[0].text, parse_mode="")
+
+        elif any(p in text_l for p in ["scan emails","check emails for receipts","scan for receipts",
+                                        "find receipts","check for invoices","/scanemails"]):
+            days = 10
+            for word in text_l.split():
+                if word.isdigit():
+                    days = int(word)
+                    break
+            send_message(chat_id, "Scanning your emails for receipts from the last " + str(days) + " days...", parse_mode="")
+            try:
+                result = scan_and_log_receipts(days)
+                logged  = result["logged"]
+                if not logged:
+                    send_message(chat_id, "No new receipts found in the last " + str(days) + " days. " + str(result["total_scanned"]) + " emails scanned.", parse_mode="")
+                else:
+                    lines = ["Found and logged " + str(len(logged)) + " receipts:", ""]
+                    for item in logged:
+                        lines.append(item["inv_id"] + " | " + item["vendor"] + " | TTD " + str(item["total"]))
+                    lines.append("")
+                    lines.append("All added to your Google Sheet!")
+                    send_message(chat_id, " | ".join(lines), parse_mode="")
+            except Exception as e:
+                send_message(chat_id, "Error scanning emails: " + str(e)[:100], parse_mode="")
 
         elif any(p in text_l for p in ["clear the sheet","clear sheet","delete all invoices",
                                         "delete all entries","start fresh","start over",
