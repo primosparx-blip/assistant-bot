@@ -372,16 +372,12 @@ def telegram_webhook():
 
         # ── Natural language fallback via Claude ──────────────────────────
         else:
-            # Check if question is about accounting/invoices — fetch data first
+            # Always fetch accounting data so assistant can answer any financial question
             accounting_context = ""
-            accounting_keywords = ["invoice","invoices","expense","expenses","spend","spending",
-                                   "total","payment","bill","bills","cost","costs","receipt",
-                                   "category","categories","accounting","last invoice","recent invoice",
-                                   "breakdown","details","vendor","how much","what did i","list"]
-            if any(kw in text_l for kw in accounting_keywords) and ACCOUNTING_API_URL:
+            if ACCOUNTING_API_URL:
                 try:
                     # Get full invoice list for detailed questions
-                    inv_r    = requests.get(f"{ACCOUNTING_API_URL}/api/invoices?limit=20", timeout=10)
+                    inv_r    = requests.get(f"{ACCOUNTING_API_URL}/api/invoices?limit=50", timeout=10)
                     inv_data = inv_r.json()
                     sum_r    = requests.get(f"{ACCOUNTING_API_URL}/api/summary", timeout=10)
                     sum_data = sum_r.json()
@@ -418,9 +414,10 @@ def telegram_webhook():
                 messages=[{"role":"user","content":
                     f"You are George's personal business assistant. The user said: '{text}'\n"
                     f"{accounting_context}\n\n"
-                    "Answer the question directly using the data provided. "
-                    "Be concise and helpful. Use TTD for currency. "
-                    "Never tell the user to ask another bot or use a command — just answer directly."
+                    "IMPORTANT: You have full access to George's invoice and accounting data above. "
+                    "Always answer directly using that data — never say you don't have access. "
+                    "Search the invoice list for vendor names, amounts, dates. "
+                    "Use TTD for currency. Be concise and specific."
                 }]
             )
             send_message(chat_id, response.content[0].text)
