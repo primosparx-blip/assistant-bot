@@ -217,6 +217,53 @@ def get_accounting_context():
     except Exception as e:
         return ""
 
+def web_search(query):
+    """Search the web using DuckDuckGo instant answer API - no key needed."""
+    try:
+        r = requests.get(
+            "https://api.duckduckgo.com/",
+            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
+            timeout=10
+        )
+        data = r.json()
+        results = []
+
+        # Abstract (main answer)
+        if data.get("AbstractText"):
+            results.append(data["AbstractText"])
+
+        # Related topics
+        for topic in data.get("RelatedTopics", [])[:3]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                results.append(topic["Text"])
+
+        if results:
+            return " | ".join(results[:3])
+        else:
+            return "No results found for: " + query
+
+    except Exception as e:
+        return "Search error: " + str(e)
+
+def web_search(query):
+    try:
+        r = requests.get(
+            "https://api.duckduckgo.com/",
+            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
+            timeout=10
+        )
+        data = r.json()
+        results = []
+        if data.get("AbstractText"):
+            results.append(data["AbstractText"])
+        for topic in data.get("RelatedTopics", [])[:3]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                results.append(topic["Text"])
+        return (" ".join(results[:3])) if results else "No results found for: " + query
+    except Exception as e:
+        return "Search error: " + str(e)
+
+
 def get_full_briefing():
     today    = datetime.datetime.utcnow() - datetime.timedelta(hours=4)
     hour     = today.hour
@@ -336,6 +383,8 @@ def telegram_webhook():
                 "/emails /send [instruction]\n\n"
                 "*Business:*\n"
                 "/briefing /accounting /lesson\n\n"
+                "*Search:*\n"
+                "/search [topic] or just ask naturally\n\n"
                 "*Sheet:*\n"
                 "clear the sheet\n\n"
                 "Or just type naturally!"
@@ -441,6 +490,40 @@ def telegram_webhook():
                     )
             else:
                 send_message(chat_id, "Accounting API not configured.", parse_mode="")
+
+        elif text_l.startswith("/search") or text_l.startswith("search for") or text_l.startswith("search ") or text_l.startswith("look up") or text_l.startswith("find out"):
+            query = text.replace("/search","").replace("search for","").replace("search","").replace("look up","").replace("find out","").strip()
+            if not query:
+                send_message(chat_id, "What would you like me to search for?", parse_mode="")
+            else:
+                send_message(chat_id, "Searching for: " + query + "...", parse_mode="")
+                result = web_search(query)
+                # Use Claude to format the result nicely
+                resp = claude.messages.create(
+                    model="claude-sonnet-4-5",
+                    max_tokens=300,
+                    messages=[{"role":"user","content":
+                        "User searched: " + query + ". Results: " + result + ". Summarise in 3-5 sentences."
+                    }]
+                )
+                send_message(chat_id, resp.content[0].text, parse_mode="")
+
+        elif text_l.startswith("/search") or "search for" in text_l or "look up" in text_l:
+            query = text_l.replace("/search","").replace("search for","").replace("look up","").strip()
+            if not query:
+                send_message(chat_id, "What would you like me to search for?", parse_mode="")
+            else:
+                send_message(chat_id, "Searching...", parse_mode="")
+                result = web_search(query)
+                resp = claude.messages.create(
+                    model="claude-sonnet-4-5",
+                    max_tokens=300,
+                    messages=[{"role":"user","content":
+                        "User searched: " + query + ". Results: " + result +
+                        ". Summarise clearly in 3-5 sentences."
+                    }]
+                )
+                send_message(chat_id, resp.content[0].text, parse_mode="")
 
         elif any(p in text_l for p in ["clear the sheet","clear sheet","delete all invoices",
                                         "delete all entries","start fresh","start over",
