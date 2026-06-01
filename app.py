@@ -372,14 +372,39 @@ def telegram_webhook():
 
         # ── Natural language fallback via Claude ──────────────────────────
         else:
+            # Check if question is about accounting/invoices — fetch data first
+            accounting_context = ""
+            accounting_keywords = ["invoice","invoices","expense","expenses","spend","spending",
+                                   "total","payment","bill","bills","cost","costs","receipt",
+                                   "category","categories","accounting","last invoice","recent invoice"]
+            if any(kw in text_l for kw in accounting_keywords) and ACCOUNTING_API_URL:
+                try:
+                    r    = requests.get(f"{ACCOUNTING_API_URL}/api/summary", timeout=10)
+                    data = r.json()
+                    if data.get("status") == "ok":
+                        top = ", ".join([f"{c['category']}: TTD {c['amount']:,.2f}"
+                                        for c in data.get("top_categories",[])])
+                        accounting_context = (
+                            f"\n\nCurrent accounting data: "
+                            f"Total invoices: {data.get('total_invoices',0)}, "
+                            f"Pending: {data.get('pending_invoices',0)}, "
+                            f"This week: TTD {data.get('total_spend_this_week',0):,.2f}, "
+                            f"This month: TTD {data.get('total_spend_this_month',0):,.2f}, "
+                            f"All time: TTD {data.get('total_spend_all_time',0):,.2f}, "
+                            f"Top categories: {top}"
+                        )
+                except:
+                    pass
+
             response = claude.messages.create(
                 model="claude-sonnet-4-5",
-                max_tokens=300,
+                max_tokens=400,
                 messages=[{"role":"user","content":
-                    f"You are a personal assistant. The user said: '{text}'\n"
-                    "Respond helpfully in 2-3 sentences. If they're asking to do something "
-                    "with calendar/email/accounting, tell them the exact command to use. "
-                    "Available commands: /today /week /schedule /emails /send /briefing /accounting"
+                    f"You are George's personal business assistant. The user said: '{text}'\n"
+                    f"{accounting_context}\n\n"
+                    "Answer the question directly using the data provided. "
+                    "Be concise and helpful. Use TTD for currency. "
+                    "Never tell the user to ask another bot or use a command — just answer directly."
                 }]
             )
             send_message(chat_id, response.content[0].text)
