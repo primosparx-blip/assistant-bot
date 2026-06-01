@@ -1,25 +1,23 @@
 """
-PrimoAssistanttBot — Telegram Personal Assistant
-Commander agent: orchestrates all other agents, manages Gmail + Google Calendar
+PrimoAssistanttBot - Telegram Personal Assistant
+Commander agent with daily briefings, Gmail, Calendar, and business lessons
 """
-import os, json, base64, datetime, requests, traceback, threading, time
+import os, json, base64, datetime, hashlib, requests, traceback, threading, time
 from flask import Flask, request, jsonify
 import anthropic
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-import email as emaillib
 from email.mime.text import MIMEText
 
 app = Flask(__name__)
 
-# ── Config ──────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN        = os.environ["ASSISTANT_BOT_TOKEN"]
-ANTHROPIC_API_KEY     = os.environ["ANTHROPIC_API_KEY"]
-GOOGLE_TOKEN_JSON     = os.environ.get("GOOGLE_TOKEN_JSON", "")
-ACCOUNTING_API_URL    = os.environ.get("ACCOUNTING_API_URL", "")  # Railway URL of accounting bot
-OWNER_CHAT_ID         = os.environ.get("OWNER_CHAT_ID", "")       # Your Telegram chat ID
-TELEGRAM_API          = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+TELEGRAM_TOKEN     = os.environ["ASSISTANT_BOT_TOKEN"]
+ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
+GOOGLE_TOKEN_JSON  = os.environ.get("GOOGLE_TOKEN_JSON", "")
+ACCOUNTING_API_URL = os.environ.get("ACCOUNTING_API_URL", "")
+OWNER_CHAT_ID      = os.environ.get("OWNER_CHAT_ID", "")
+TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -29,7 +27,16 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar"
 ]
 
-# ── Google Auth ─────────────────────────────────────────────────────────────
+BUSINESS_CONCEPTS = [
+    "opportunity cost", "cash flow", "gross margin", "EBITDA",
+    "working capital", "accounts receivable", "break even point", "return on investment",
+    "cost of goods sold", "net profit margin", "liquidity", "economies of scale",
+    "fixed vs variable costs", "price elasticity", "brand equity",
+    "customer lifetime value", "churn rate", "gross profit",
+    "overheads", "markup vs margin", "debtors and creditors",
+    "accounts payable", "depreciation", "inventory turnover", "profit margin"
+]
+
 def get_google_creds():
     if GOOGLE_TOKEN_JSON:
         token_data = json.loads(GOOGLE_TOKEN_JSON)
@@ -41,9 +48,11 @@ def get_google_creds():
         creds.refresh(Request())
     return creds
 
-# ── Gmail ───────────────────────────────────────────────────────────────────
 def get_gmail_service():
     return build("gmail", "v1", credentials=get_google_creds())
+
+def get_calendar_service():
+    return build("calendar", "v3", credentials=get_google_creds())
 
 def get_unread_emails(max_results=5):
     service = get_gmail_service()
@@ -58,34 +67,31 @@ def get_unread_emails(max_results=5):
             metadataHeaders=["From","Subject","Date"]
         ).execute()
         headers = {h["name"]:h["value"] for h in detail["payload"]["headers"]}
-        snippet = detail.get("snippet","")
         emails.append({
             "id": msg["id"],
             "from": headers.get("From",""),
             "subject": headers.get("Subject",""),
             "date": headers.get("Date",""),
-            "snippet": snippet[:120]
+            "snippet": detail.get("snippet","")[:120]
         })
     return emails
 
 def send_email(to, subject, body):
-    service = get_gmail_service()
-    message = MIMEText(body)
+    service  = get_gmail_service()
+    message  = MIMEText(body)
     message["to"]      = to
     message["subject"] = subject
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
     service.users().messages().send(userId="me", body={"raw":raw}).execute()
 
 def draft_email_with_claude(instruction):
-    """Use Claude to draft an email from a natural language instruction."""
     response = claude.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=512,
         messages=[{"role":"user","content":
-            f"Draft a professional email based on this instruction: {instruction}\n\n"
-            "Return ONLY valid JSON: "
-            '{"to":"email@example.com","subject":"Subject here","body":"Email body here"}\n'
-            "If no recipient is mentioned use to: unknown@unknown.com"
+            "Draft a professional email based on this instruction: " + instruction +
+            "\n\nReturn ONLY valid JSON: "
+            '{"to":"email@example.com","subject":"Subject here","body":"Email body here"}'
         }]
     )
     raw = response.content[0].text.strip()
@@ -94,36 +100,32 @@ def draft_email_with_claude(instruction):
         if raw.startswith("json"): raw = raw[4:]
     return json.loads(raw)
 
-# ── Google Calendar ─────────────────────────────────────────────────────────
-def get_calendar_service():
-    return build("calendar", "v3", credentials=get_google_creds())
-
 def get_todays_events():
-    service   = get_calendar_service()
-    now       = datetime.datetime.utcnow()
-    start     = now.replace(hour=0, minute=0, second=0).isoformat() + "Z"
-    end       = now.replace(hour=23, minute=59, second=59).isoformat() + "Z"
-    events_result = service.events().list(
+    service = get_calendar_service()
+    now     = datetime.datetime.utcnow()
+    start   = now.replace(hour=0,  minute=0,  second=0).isoformat()  + "Z"
+    end     = now.replace(hour=23, minute=59, second=59).isoformat() + "Z"
+    result  = service.events().list(
         calendarId="primary", timeMin=start, timeMax=end,
         singleEvents=True, orderBy="startTime"
     ).execute()
-    return events_result.get("items", [])
+    return result.get("items", [])
 
 def get_weeks_events():
-    service   = get_calendar_service()
-    now       = datetime.datetime.utcnow()
-    start     = now.isoformat() + "Z"
-    end       = (now + datetime.timedelta(days=7)).isoformat() + "Z"
-    events_result = service.events().list(
+    service = get_calendar_service()
+    now     = datetime.datetime.utcnow()
+    start   = now.isoformat() + "Z"
+    end     = (now + datetime.timedelta(days=7)).isoformat() + "Z"
+    result  = service.events().list(
         calendarId="primary", timeMin=start, timeMax=end,
         singleEvents=True, orderBy="startTime", maxResults=20
     ).execute()
-    return events_result.get("items", [])
+    return result.get("items", [])
 
 def create_calendar_event(summary, start_dt, end_dt, description=""):
     service = get_calendar_service()
     event   = {
-        "summary": summary,
+        "summary":     summary,
         "description": description,
         "start": {"dateTime": start_dt.isoformat(), "timeZone": "America/Port_of_Spain"},
         "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "America/Port_of_Spain"},
@@ -131,16 +133,15 @@ def create_calendar_event(summary, start_dt, end_dt, description=""):
     return service.events().insert(calendarId="primary", body=event).execute()
 
 def parse_event_with_claude(instruction):
-    """Use Claude to parse a natural language scheduling request."""
     today = datetime.date.today().isoformat()
     response = claude.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=256,
         messages=[{"role":"user","content":
-            f"Today is {today}. Parse this scheduling request: '{instruction}'\n\n"
-            "Return ONLY valid JSON:\n"
-            '{"summary":"Event title","date":"YYYY-MM-DD","start_time":"HH:MM","duration_hours":1,"description":""}\n'
-            "Use 24-hour time. If no duration mentioned assume 1 hour."
+            "Today is " + today + ". Parse this scheduling request: '" + instruction + "'\n\n"
+            'Return ONLY valid JSON: {"summary":"Event title","date":"YYYY-MM-DD",'
+            '"start_time":"HH:MM","duration_hours":1,"description":""}\n'
+            "Use 24hr time. Default duration 1 hour if not mentioned."
         }]
     )
     raw = response.content[0].text.strip()
@@ -150,302 +151,331 @@ def parse_event_with_claude(instruction):
     return json.loads(raw)
 
 def format_event(event):
-    start = event.get("start",{})
+    start    = event.get("start", {})
     time_str = start.get("dateTime","") or start.get("date","")
     try:
-        dt = datetime.datetime.fromisoformat(time_str.replace("Z",""))
-        time_str = dt.strftime("%a %b %d, %I:%M %p")
+        dt       = datetime.datetime.fromisoformat(time_str.replace("Z",""))
+        dt_local = dt - datetime.timedelta(hours=4)
+        time_str = dt_local.strftime("%I:%M %p")
     except:
         pass
-    return f"📅 *{event.get('summary','No title')}*\n   {time_str}"
+    return "  - " + event.get("summary","No title") + " at " + time_str
 
-# ── Orchestrator: query all agents ──────────────────────────────────────────
-def get_full_business_briefing():
-    lines = [f"🌅 *Good morning George!*\n_{datetime.date.today().strftime('%A, %B %d, %Y')}_\n"]
+def get_daily_lesson():
+    today_str = datetime.date.today().isoformat()
+    idx       = int(hashlib.md5(today_str.encode()).hexdigest(), 16) % len(BUSINESS_CONCEPTS)
+    concept   = BUSINESS_CONCEPTS[idx]
+    prompt    = (
+        "Explain the business concept of " + concept + " in 2-3 simple sentences. "
+        "Use a practical example a restaurant owner in Trinidad would relate to. "
+        "Keep it under 60 words. Do not use any markdown formatting."
+    )
+    resp = claude.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=120,
+        messages=[{"role":"user","content": prompt}]
+    )
+    return "Today's Business Lesson: " + concept.title() + "\n\n" + resp.content[0].text
+
+def get_accounting_context():
+    if not ACCOUNTING_API_URL:
+        return ""
+    try:
+        sum_r  = requests.get(ACCOUNTING_API_URL + "/api/summary", timeout=10)
+        inv_r  = requests.get(ACCOUNTING_API_URL + "/api/invoices?limit=50", timeout=10)
+        sdata  = sum_r.json()
+        idata  = inv_r.json()
+        if sdata.get("status") != "ok":
+            return ""
+        invoices  = idata.get("invoices", [])
+        inv_lines = []
+        for inv in invoices:
+            inv_lines.append(
+                "ID:" + str(inv.get("ID","")) + " | " +
+                str(inv.get("Date Received","")) + " | " +
+                str(inv.get("Vendor","")) + " | " +
+                str(inv.get("Category","")) + " | TTD " +
+                str(inv.get("Amount",0)) + " | Tax: TTD " +
+                str(inv.get("Tax",0)) + " | Total: TTD " +
+                str(inv.get("Total",0)) + " | Status: " +
+                str(inv.get("Status",""))
+            )
+        top = ", ".join([
+            c["category"] + ": TTD " + str(round(c["amount"],2))
+            for c in sdata.get("top_categories",[])
+        ])
+        return (
+            "\n\nAccounting data - " +
+            "Total invoices: " + str(sdata.get("total_invoices",0)) + ", " +
+            "Pending: " + str(sdata.get("pending_invoices",0)) + ", " +
+            "This week: TTD " + str(sdata.get("total_spend_this_week",0)) + ", " +
+            "This month: TTD " + str(sdata.get("total_spend_this_month",0)) + ", " +
+            "All time: TTD " + str(sdata.get("total_spend_all_time",0)) + ", " +
+            "Top categories: " + top +
+            "\n\nAll invoices:\n" + "\n".join(inv_lines)
+        )
+    except Exception as e:
+        return ""
+
+def get_full_briefing():
+    today    = datetime.datetime.utcnow() - datetime.timedelta(hours=4)
+    hour     = today.hour
+    greeting = "Good morning" if hour < 12 else ("Good afternoon" if hour < 17 else "Good evening")
+    day_str  = today.strftime("%A, %B %d, %Y")
+    lines    = [greeting + " George!", day_str, ""]
 
     # Calendar
     try:
         events = get_todays_events()
         if events:
-            lines.append(f"📅 *Today's Schedule ({len(events)} events):*")
-            for e in events[:5]:
-                lines.append(f"  {format_event(e)}")
+            lines.append("Today's Schedule (" + str(len(events)) + " events):")
+            for e in events[:8]:
+                lines.append(format_event(e))
         else:
-            lines.append("📅 *Calendar:* Nothing scheduled today")
-    except Exception as e:
-        lines.append(f"📅 Calendar: unavailable")
+            lines.append("Calendar: No events today - free day!")
+    except:
+        lines.append("Calendar: unavailable")
+
+    lines.append("")
 
     # Email
     try:
-        emails = get_unread_emails(3)
+        emails = get_unread_emails(5)
         if emails:
-            lines.append(f"\n📧 *Unread Emails ({len(emails)}):*")
-            for em in emails:
-                lines.append(f"  • From: {em['from'][:30]}\n    {em['subject'][:50]}")
+            lines.append("Unread Emails (" + str(len(emails)) + "):")
+            for em in emails[:5]:
+                sender  = em["from"].split("<")[0].strip()[:30]
+                subject = em["subject"][:50]
+                lines.append("  - " + sender + ": " + subject)
         else:
-            lines.append("\n📧 *Email:* Inbox is clear ✅")
-    except Exception as e:
-        lines.append("\n📧 Email: unavailable")
+            lines.append("Email: Inbox clear!")
+    except:
+        lines.append("Email: unavailable")
 
-    # Accounting Agent
+    lines.append("")
+
+    # Expenses
     if ACCOUNTING_API_URL:
         try:
-            r = requests.get(f"{ACCOUNTING_API_URL}/api/summary", timeout=10)
-            data = r.json()
-            if data.get("status") == "ok":
-                lines.append(
-                    f"\n📊 *Accounting:*\n"
-                    f"  • Pending invoices: {data.get('pending_invoices',0)}\n"
-                    f"  • This week: ${data.get('total_spend_this_week',0):,.2f}\n"
-                    f"  • This month: ${data.get('total_spend_this_month',0):,.2f}"
-                )
+            sum_r  = requests.get(ACCOUNTING_API_URL + "/api/summary", timeout=10)
+            inv_r  = requests.get(ACCOUNTING_API_URL + "/api/invoices?limit=5", timeout=10)
+            sdata  = sum_r.json()
+            idata  = inv_r.json()
+            if sdata.get("status") == "ok":
+                lines.append("Expenses:")
+                lines.append("  - This week: TTD " + str(round(sdata.get("total_spend_this_week",0),2)))
+                lines.append("  - This month: TTD " + str(round(sdata.get("total_spend_this_month",0),2)))
+                lines.append("  - Pending invoices: " + str(sdata.get("pending_invoices",0)))
+                top = sdata.get("top_categories",[])
+                if top:
+                    lines.append("  - Top categories:")
+                    for c in top[:3]:
+                        lines.append("    * " + c["category"] + ": TTD " + str(round(c["amount"],2)))
+                invoices = idata.get("invoices",[])
+                if invoices:
+                    lines.append("  - Recent invoices:")
+                    for inv in list(reversed(invoices))[:3]:
+                        lines.append("    * " + str(inv.get("Vendor","")) + " TTD " + str(inv.get("Total",0)))
         except:
-            lines.append("\n📊 Accounting: unavailable")
+            lines.append("Expenses: unavailable")
 
-    lines.append("\n_Type /help for all commands_")
+    lines.append("")
+    lines.append("---")
+
+    # Daily business lesson
+    try:
+        lesson = get_daily_lesson()
+        lines.append(lesson)
+    except Exception as e:
+        print("Lesson error: " + str(e))
+
+    lines.append("")
+    lines.append("Type /help for all commands")
     return "\n".join(lines)
 
-# ── Telegram helpers ────────────────────────────────────────────────────────
 def send_message(chat_id, text, parse_mode="Markdown"):
-    requests.post(f"{TELEGRAM_API}/sendMessage",
-                  json={"chat_id":chat_id,"text":text,"parse_mode":parse_mode})
+    requests.post(
+        TELEGRAM_API + "/sendMessage",
+        json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    )
 
-# ── Morning briefing scheduler ──────────────────────────────────────────────
 def morning_scheduler():
-    """Send daily briefing at 8am Trinidad time (12:00 UTC)."""
+    last_sent = None
     while True:
-        now = datetime.datetime.utcnow()
-        if now.hour == 12 and now.minute < 5 and OWNER_CHAT_ID:
+        now  = datetime.datetime.utcnow()
+        date = now.date()
+        if now.hour == 12 and now.minute < 5 and OWNER_CHAT_ID and last_sent != date:
             try:
-                briefing = get_full_business_briefing()
-                send_message(OWNER_CHAT_ID, briefing)
+                print("Sending morning briefing at " + str(now))
+                briefing = get_full_briefing()
+                send_message(OWNER_CHAT_ID, briefing, parse_mode="")
+                last_sent = date
             except Exception as e:
-                print(f"Morning briefing error: {e}")
-            time.sleep(360)
+                print("Morning briefing error: " + str(e))
         time.sleep(60)
 
-# ── Main webhook ─────────────────────────────────────────────────────────────
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
     update  = request.json
     if not update:
         return "ok"
-
     msg     = update.get("message", {})
     chat_id = msg.get("chat", {}).get("id")
     text    = msg.get("text", "").strip()
     text_l  = text.lower()
-
     if not chat_id:
         return "ok"
 
     try:
-        # ── /start or /help ───────────────────────────────────────────────
         if text_l in ("/start", "/help", "help"):
             send_message(chat_id,
-                "👋 *Primo Personal Assistant*\n\n"
-                "I manage your calendar, email, and coordinate all your agents.\n\n"
-                "*📅 Calendar:*\n"
-                "• /today — today's schedule\n"
-                "• /week — this week's events\n"
-                "• /schedule [event] — create an event\n\n"
-                "*📧 Email:*\n"
-                "• /emails — unread emails\n"
-                "• /send [instruction] — draft & send email\n\n"
-                "*🏢 Business:*\n"
-                "• /briefing — full business update\n"
-                "• /accounting — accounting summary\n\n"
-                "*💬 Natural language:*\n"
-                "Just type naturally — I understand plain English!"
+                "*Primo Personal Assistant*\n\n"
+                "*Calendar:*\n"
+                "/today /week /schedule [event]\n\n"
+                "*Email:*\n"
+                "/emails /send [instruction]\n\n"
+                "*Business:*\n"
+                "/briefing /accounting /lesson\n\n"
+                "*Sheet:*\n"
+                "clear the sheet\n\n"
+                "Or just type naturally!"
             )
 
-        # ── Briefing ──────────────────────────────────────────────────────
-        elif text_l in ("/briefing", "briefing", "update", "morning"):
-            send_message(chat_id, "⏳ Getting your briefing...")
-            send_message(chat_id, get_full_business_briefing())
+        elif text_l in ("/briefing", "briefing", "update", "morning", "good morning"):
+            send_message(chat_id, "Getting your briefing...", parse_mode="")
+            send_message(chat_id, get_full_briefing(), parse_mode="")
 
-        # ── Calendar: today ───────────────────────────────────────────────
-        elif text_l in ("/today", "today", "what's today", "whats today"):
+        elif text_l in ("/lesson", "lesson", "business lesson", "teach me something"):
+            send_message(chat_id, get_daily_lesson(), parse_mode="")
+
+        elif text_l in ("/today", "today"):
             events = get_todays_events()
             if not events:
-                send_message(chat_id, "📅 Nothing on your calendar today! Free day ✅")
+                send_message(chat_id, "Nothing on your calendar today!")
             else:
-                lines = [f"📅 *Today — {datetime.date.today().strftime('%A, %B %d')}*\n"]
+                lines = ["Today - " + datetime.date.today().strftime("%A, %B %d") + "\n"]
                 for e in events:
                     lines.append(format_event(e))
-                send_message(chat_id, "\n".join(lines))
+                send_message(chat_id, "\n".join(lines), parse_mode="")
 
-        # ── Calendar: week ────────────────────────────────────────────────
-        elif text_l in ("/week", "week", "this week", "weekly schedule"):
+        elif text_l in ("/week", "week", "this week"):
             events = get_weeks_events()
             if not events:
-                send_message(chat_id, "📅 Nothing in your calendar this week!")
+                send_message(chat_id, "Nothing in your calendar this week!")
             else:
-                lines = ["📅 *This Week:*\n"]
+                lines = ["This Week:\n"]
                 for e in events[:10]:
                     lines.append(format_event(e))
-                send_message(chat_id, "\n".join(lines))
+                send_message(chat_id, "\n".join(lines), parse_mode="")
 
-        # ── Calendar: schedule ────────────────────────────────────────────
-        elif text_l.startswith("/schedule") or any(w in text_l for w in ["schedule","book","set up a meeting","add to calendar","remind me"]):
+        elif text_l.startswith("/schedule") or any(w in text_l for w in ["schedule","book","set up a meeting","add to calendar"]):
             instruction = text.replace("/schedule","").strip() or text
-            send_message(chat_id, f"📅 Scheduling: _{instruction}_...")
+            send_message(chat_id, "Scheduling: " + instruction + "...", parse_mode="")
             parsed = parse_event_with_claude(instruction)
-            date_parts = parsed["date"].split("-")
-            start_dt = datetime.datetime(
-                int(date_parts[0]), int(date_parts[1]), int(date_parts[2]),
-                int(parsed["start_time"].split(":")[0]),
-                int(parsed["start_time"].split(":")[1])
-            )
-            end_dt = start_dt + datetime.timedelta(hours=float(parsed.get("duration_hours",1)))
-            event  = create_calendar_event(
-                parsed["summary"], start_dt, end_dt, parsed.get("description","")
-            )
+            dp     = parsed["date"].split("-")
+            tp     = parsed["start_time"].split(":")
+            start_dt = datetime.datetime(int(dp[0]),int(dp[1]),int(dp[2]),int(tp[0]),int(tp[1]))
+            end_dt   = start_dt + datetime.timedelta(hours=float(parsed.get("duration_hours",1)))
+            create_calendar_event(parsed["summary"], start_dt, end_dt, parsed.get("description",""))
             send_message(chat_id,
-                f"✅ *Event Created!*\n\n"
-                f"📅 {parsed['summary']}\n"
-                f"🕐 {start_dt.strftime('%A, %B %d at %I:%M %p')}\n"
-                f"⏱ Duration: {parsed.get('duration_hours',1)} hour(s)"
+                "Event Created!\n\n" +
+                parsed["summary"] + "\n" +
+                start_dt.strftime("%A, %B %d at %I:%M %p") + "\n" +
+                "Duration: " + str(parsed.get("duration_hours",1)) + " hour(s)",
+                parse_mode=""
             )
 
-        # ── Email: read ───────────────────────────────────────────────────
         elif text_l in ("/emails", "emails", "check email", "unread", "inbox"):
-            send_message(chat_id, "📧 Checking your inbox...")
+            send_message(chat_id, "Checking your inbox...", parse_mode="")
             emails = get_unread_emails(5)
             if not emails:
-                send_message(chat_id, "📧 No unread emails! Inbox is clear ✅")
+                send_message(chat_id, "Inbox is clear!", parse_mode="")
             else:
-                lines = [f"📧 *{len(emails)} Unread Emails:*\n"]
-                for i,em in enumerate(emails,1):
-                    lines.append(
-                        f"*{i}.* {em['subject'][:50]}\n"
-                        f"   From: {em['from'][:40]}\n"
-                        f"   _{em['snippet'][:80]}_\n"
-                    )
-                send_message(chat_id, "\n".join(lines))
+                lines = [str(len(emails)) + " Unread Emails:\n"]
+                for i, em in enumerate(emails, 1):
+                    lines.append(str(i) + ". " + em["subject"][:50])
+                    lines.append("   From: " + em["from"][:40])
+                    lines.append("   " + em["snippet"][:80])
+                    lines.append("")
+                send_message(chat_id, "\n".join(lines), parse_mode="")
 
-        # ── Email: send ───────────────────────────────────────────────────
         elif text_l.startswith("/send") or any(w in text_l for w in ["send email","email to","write to","draft email"]):
             instruction = text.replace("/send","").strip() or text
-            send_message(chat_id, f"📧 Drafting email: _{instruction}_...")
+            send_message(chat_id, "Drafting: " + instruction + "...", parse_mode="")
             draft = draft_email_with_claude(instruction)
             send_message(chat_id,
-                f"📧 *Email Ready to Send:*\n\n"
-                f"To: {draft['to']}\n"
-                f"Subject: {draft['subject']}\n\n"
-                f"_{draft['body'][:300]}_\n\n"
-                f"Reply *confirm* to send or *cancel* to discard."
+                "Email Draft:\n\nTo: " + draft["to"] +
+                "\nSubject: " + draft["subject"] +
+                "\n\n" + draft["body"][:300] +
+                "\n\nReply confirm to send or cancel to discard.",
+                parse_mode=""
             )
-            # Store pending draft in simple memory
             app.pending_drafts = getattr(app, "pending_drafts", {})
             app.pending_drafts[chat_id] = draft
 
-        # ── Confirm email send ────────────────────────────────────────────
-        elif text_l in ("confirm","yes","send it") and hasattr(app,"pending_drafts") and chat_id in app.pending_drafts:
+        elif text_l in ("confirm","yes send","send it") and hasattr(app,"pending_drafts") and chat_id in app.pending_drafts:
             draft = app.pending_drafts.pop(chat_id)
             send_email(draft["to"], draft["subject"], draft["body"])
-            send_message(chat_id, f"✅ Email sent to *{draft['to']}*!")
+            send_message(chat_id, "Email sent to " + draft["to"] + "!", parse_mode="")
 
         elif text_l in ("cancel","no","discard") and hasattr(app,"pending_drafts") and chat_id in app.pending_drafts:
             app.pending_drafts.pop(chat_id)
-            send_message(chat_id, "❌ Email discarded.")
+            send_message(chat_id, "Email discarded.", parse_mode="")
 
-        # ── Clear sheet via assistant — no confirmation loop, just do it ──
-        elif any(phrase in text_l for phrase in ["clear the sheet","clear sheet","delete all invoices",
-                                                  "delete all entries","start fresh","start over",
-                                                  "wipe the sheet","reset the sheet","clear all data"]):
-            send_message(chat_id, "🗑 Clearing all invoice data now...")
-            try:
-                if ACCOUNTING_API_URL:
-                    r    = requests.post(f"{ACCOUNTING_API_URL}/api/clearsheet", timeout=15)
-                    data = r.json()
-                    if data.get("status") == "ok":
-                        send_message(chat_id, "✅ All sheets cleared! Ready for a fresh start. Next invoice will be INV-001.")
-                    else:
-                        send_message(chat_id, f"❌ Error: {data.get('message','unknown error')}")
-                else:
-                    send_message(chat_id, "⚠️ Accounting API URL not configured.")
-            except Exception as e:
-                send_message(chat_id, f"❌ Error: {str(e)[:100]}")
-
-        # ── Accounting summary ────────────────────────────────────────────
-        elif text_l in ("/accounting","accounting","expenses","spending"):
+        elif text_l in ("/accounting", "accounting", "expenses", "spending"):
             if ACCOUNTING_API_URL:
-                r    = requests.get(f"{ACCOUNTING_API_URL}/api/summary", timeout=10)
+                r    = requests.get(ACCOUNTING_API_URL + "/api/summary", timeout=10)
                 data = r.json()
                 if data.get("status") == "ok":
-                    top = "\n".join([f"  • {c['category']}: ${c['amount']:,.2f}"
-                                     for c in data.get("top_categories",[])])
+                    top  = "\n".join(["  * " + c["category"] + ": TTD " + str(round(c["amount"],2))
+                                      for c in data.get("top_categories",[])])
                     send_message(chat_id,
-                        f"📊 *Accounting Summary*\n\n"
-                        f"📋 Total invoices: {data.get('total_invoices',0)}\n"
-                        f"⏳ Pending: {data.get('pending_invoices',0)}\n"
-                        f"💵 This week: ${data.get('total_spend_this_week',0):,.2f}\n"
-                        f"📅 This month: ${data.get('total_spend_this_month',0):,.2f}\n"
-                        f"💰 All time: ${data.get('total_spend_all_time',0):,.2f}\n\n"
-                        f"📂 *Top Categories:*\n{top}"
+                        "Accounting Summary\n\n"
+                        "Total invoices: " + str(data.get("total_invoices",0)) + "\n"
+                        "Pending: " + str(data.get("pending_invoices",0)) + "\n"
+                        "This week: TTD " + str(round(data.get("total_spend_this_week",0),2)) + "\n"
+                        "This month: TTD " + str(round(data.get("total_spend_this_month",0),2)) + "\n"
+                        "All time: TTD " + str(round(data.get("total_spend_all_time",0),2)) + "\n\n"
+                        "Top Categories:\n" + top,
+                        parse_mode=""
                     )
             else:
-                send_message(chat_id, "⚠️ Accounting Agent URL not configured. Add ACCOUNTING_API_URL to Railway variables.")
+                send_message(chat_id, "Accounting API not configured.", parse_mode="")
 
-        # ── Natural language fallback via Claude ──────────────────────────
+        elif any(p in text_l for p in ["clear the sheet","clear sheet","delete all invoices",
+                                        "delete all entries","start fresh","start over",
+                                        "wipe the sheet","reset the sheet","clear all data"]):
+            send_message(chat_id, "Clearing all invoice data now...", parse_mode="")
+            try:
+                r    = requests.post(ACCOUNTING_API_URL + "/api/clearsheet", timeout=15)
+                data = r.json()
+                if data.get("status") == "ok":
+                    send_message(chat_id, "All sheets cleared! Ready for a fresh start. Next invoice will be INV-001.", parse_mode="")
+                else:
+                    send_message(chat_id, "Error: " + data.get("message","unknown"), parse_mode="")
+            except Exception as e:
+                send_message(chat_id, "Error: " + str(e)[:100], parse_mode="")
+
         else:
-            # Always fetch accounting data so assistant can answer any financial question
-            accounting_context = ""
-            if ACCOUNTING_API_URL:
-                try:
-                    # Get full invoice list for detailed questions
-                    inv_r    = requests.get(f"{ACCOUNTING_API_URL}/api/invoices?limit=50", timeout=10)
-                    inv_data = inv_r.json()
-                    sum_r    = requests.get(f"{ACCOUNTING_API_URL}/api/summary", timeout=10)
-                    sum_data = sum_r.json()
-
-                    invoices = inv_data.get("invoices", [])
-                    inv_lines = []
-                    for inv in invoices[-10:]:  # last 10 invoices
-                        inv_lines.append(
-                            f"ID:{inv.get('ID','')} | {inv.get('Date Received','')} | "
-                            f"{inv.get('Vendor','')} | {inv.get('Category','')} | "
-                            f"TTD {inv.get('Amount',0)} | Tax: TTD {inv.get('Tax',0)} | "
-                            f"Total: TTD {inv.get('Total',0)} | Status: {inv.get('Status','')}"
-                        )
-                    inv_text = "\n".join(inv_lines)
-
-                    top = ", ".join([f"{c['category']}: TTD {c['amount']:,.2f}"
-                                    for c in sum_data.get("top_categories",[])])
-                    accounting_context = (
-                        f"\n\nAccounting Summary: "
-                        f"Total invoices: {sum_data.get('total_invoices',0)}, "
-                        f"Pending: {sum_data.get('pending_invoices',0)}, "
-                        f"This week: TTD {sum_data.get('total_spend_this_week',0):,.2f}, "
-                        f"This month: TTD {sum_data.get('total_spend_this_month',0):,.2f}, "
-                        f"All time: TTD {sum_data.get('total_spend_all_time',0):,.2f}, "
-                        f"Top categories: {top}\n\n"
-                        f"Recent invoices (most recent last):\n{inv_text}"
-                    )
-                except:
-                    pass
-
+            # Natural language — fetch accounting data for context
+            acct_ctx = get_accounting_context()
             response = claude.messages.create(
                 model="claude-sonnet-4-5",
                 max_tokens=400,
                 messages=[{"role":"user","content":
-                    f"You are George's personal business assistant. The user said: '{text}'\n"
-                    f"{accounting_context}\n\n"
-                    "IMPORTANT: You have full access to George's invoice and accounting data above. "
-                    "Always answer directly using that data — never say you don't have access. "
-                    "When searching for vendors, use PARTIAL matching — if the user says 'hadco', "
-                    "match any vendor containing 'hadco' like 'Hadco Foods'. "
-                    "If user says 'more vino' match 'MoreVino' or 'MoreVino/MoreSushi'. "
-                    "Always search case-insensitively and match partial names. "
-                    "Use TTD for currency. Be concise and specific."
+                    "You are George's personal business assistant in Trinidad. "
+                    "The user said: " + text +
+                    acct_ctx +
+                    "\n\nAnswer directly using the data. Use TTD for currency. "
+                    "Do partial vendor name matching. Never say you don't have access to data. "
+                    "Be concise."
                 }]
             )
-            send_message(chat_id, response.content[0].text)
+            send_message(chat_id, response.content[0].text, parse_mode="")
 
     except Exception as e:
         traceback.print_exc()
-        send_message(chat_id, f"❌ Error: {str(e)[:100]}\n\nTry /help for available commands.")
+        send_message(chat_id, "Error: " + str(e)[:100] + "\n\nTry /help", parse_mode="")
 
     return "ok"
 
@@ -453,7 +483,6 @@ def telegram_webhook():
 def health():
     return {"status":"ok","bot":"PrimoAssistanttBot","time":str(datetime.datetime.now())}
 
-# Start morning briefing scheduler
 threading.Thread(target=morning_scheduler, daemon=True).start()
 
 if __name__ == "__main__":
