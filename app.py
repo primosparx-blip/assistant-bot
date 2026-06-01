@@ -102,16 +102,18 @@ def get_email_body(service, msg_id):
 
 def scan_emails_for_receipts(days=10):
     """Scan Gmail for receipts and invoices from the past N days."""
+    print("Starting email scan for last " + str(days) + " days")
     service = get_gmail_service()
     
-    # Search for receipt/invoice emails
-    query = "subject:(receipt OR invoice OR payment OR order confirmation OR booking) newer_than:" + str(days) + "d"
+    query = "subject:(receipt OR invoice OR payment OR confirmation OR booking OR order) newer_than:" + str(days) + "d"
+    print("Gmail query: " + query)
     
     results = service.users().messages().list(
-        userId="me", q=query, maxResults=20
+        userId="me", q=query, maxResults=30
     ).execute()
     
     messages = results.get("messages", [])
+    print("Found " + str(len(messages)) + " emails matching query")
     receipts = []
     
     for msg in messages:
@@ -122,16 +124,18 @@ def scan_emails_for_receipts(days=10):
             ).execute()
             headers = {h["name"]:h["value"] for h in detail["payload"]["headers"]}
             body    = get_email_body(service, msg["id"])
-            
+            subject = headers.get("Subject","")
+            sender  = headers.get("From","")
+            print("Email: " + subject + " from " + sender)
             receipts.append({
                 "id":      msg["id"],
-                "from":    headers.get("From",""),
-                "subject": headers.get("Subject",""),
+                "from":    sender,
+                "subject": subject,
                 "date":    headers.get("Date",""),
                 "body":    body
             })
-        except:
-            pass
+        except Exception as e:
+            print("Error reading email: " + str(e))
     
     return receipts
 
