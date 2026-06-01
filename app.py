@@ -665,21 +665,22 @@ def telegram_webhook():
                 if word.isdigit():
                     days = int(word)
                     break
-            send_message(chat_id, "Scanning your emails for receipts from the last " + str(days) + " days...", parse_mode="")
-            try:
-                result = scan_and_log_receipts(days)
-                logged  = result["logged"]
-                if not logged:
-                    send_message(chat_id, "No new receipts found in the last " + str(days) + " days. " + str(result["total_scanned"]) + " emails scanned.", parse_mode="")
-                else:
-                    lines = ["Found and logged " + str(len(logged)) + " receipts:", ""]
-                    for item in logged:
-                        lines.append(item["inv_id"] + " | " + item["vendor"] + " | TTD " + str(item["total"]))
-                    lines.append("")
-                    lines.append("All added to your Google Sheet!")
-                    send_message(chat_id, " | ".join(lines), parse_mode="")
-            except Exception as e:
-                send_message(chat_id, "Error scanning emails: " + str(e)[:100], parse_mode="")
+            send_message(chat_id, "Scanning your emails for receipts from the last " + str(days) + " days... I will message you when done.", parse_mode="")
+            def do_scan(chat_id=chat_id, days=days):
+                try:
+                    result = scan_and_log_receipts(days)
+                    logged = result["logged"]
+                    if not logged:
+                        send_message(chat_id, "No receipts found in the last " + str(days) + " days. " + str(result["total_scanned"]) + " emails scanned.", parse_mode="")
+                    else:
+                        lines = ["Found and logged " + str(len(logged)) + " receipt(s):"]
+                        for item in logged:
+                            lines.append(item["inv_id"] + " | " + item["vendor"] + " | TTD " + str(item["total"]))
+                        lines.append("All added to your Google Sheet!")
+                        send_message(chat_id, " | ".join(lines), parse_mode="")
+                except Exception as e:
+                    send_message(chat_id, "Error scanning emails: " + str(e)[:100], parse_mode="")
+            threading.Thread(target=do_scan, daemon=True).start()
 
         elif any(p in text_l for p in ["clear the sheet","clear sheet","delete all invoices",
                                         "delete all entries","start fresh","start over",
