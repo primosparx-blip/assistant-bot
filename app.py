@@ -376,23 +376,39 @@ def telegram_webhook():
             accounting_context = ""
             accounting_keywords = ["invoice","invoices","expense","expenses","spend","spending",
                                    "total","payment","bill","bills","cost","costs","receipt",
-                                   "category","categories","accounting","last invoice","recent invoice"]
+                                   "category","categories","accounting","last invoice","recent invoice",
+                                   "breakdown","details","vendor","how much","what did i","list"]
             if any(kw in text_l for kw in accounting_keywords) and ACCOUNTING_API_URL:
                 try:
-                    r    = requests.get(f"{ACCOUNTING_API_URL}/api/summary", timeout=10)
-                    data = r.json()
-                    if data.get("status") == "ok":
-                        top = ", ".join([f"{c['category']}: TTD {c['amount']:,.2f}"
-                                        for c in data.get("top_categories",[])])
-                        accounting_context = (
-                            f"\n\nCurrent accounting data: "
-                            f"Total invoices: {data.get('total_invoices',0)}, "
-                            f"Pending: {data.get('pending_invoices',0)}, "
-                            f"This week: TTD {data.get('total_spend_this_week',0):,.2f}, "
-                            f"This month: TTD {data.get('total_spend_this_month',0):,.2f}, "
-                            f"All time: TTD {data.get('total_spend_all_time',0):,.2f}, "
-                            f"Top categories: {top}"
+                    # Get full invoice list for detailed questions
+                    inv_r    = requests.get(f"{ACCOUNTING_API_URL}/api/invoices?limit=20", timeout=10)
+                    inv_data = inv_r.json()
+                    sum_r    = requests.get(f"{ACCOUNTING_API_URL}/api/summary", timeout=10)
+                    sum_data = sum_r.json()
+
+                    invoices = inv_data.get("invoices", [])
+                    inv_lines = []
+                    for inv in invoices[-10:]:  # last 10 invoices
+                        inv_lines.append(
+                            f"ID:{inv.get('ID','')} | {inv.get('Date Received','')} | "
+                            f"{inv.get('Vendor','')} | {inv.get('Category','')} | "
+                            f"TTD {inv.get('Amount',0)} | Tax: TTD {inv.get('Tax',0)} | "
+                            f"Total: TTD {inv.get('Total',0)} | Status: {inv.get('Status','')}"
                         )
+                    inv_text = "\n".join(inv_lines)
+
+                    top = ", ".join([f"{c['category']}: TTD {c['amount']:,.2f}"
+                                    for c in sum_data.get("top_categories",[])])
+                    accounting_context = (
+                        f"\n\nAccounting Summary: "
+                        f"Total invoices: {sum_data.get('total_invoices',0)}, "
+                        f"Pending: {sum_data.get('pending_invoices',0)}, "
+                        f"This week: TTD {sum_data.get('total_spend_this_week',0):,.2f}, "
+                        f"This month: TTD {sum_data.get('total_spend_this_month',0):,.2f}, "
+                        f"All time: TTD {sum_data.get('total_spend_all_time',0):,.2f}, "
+                        f"Top categories: {top}\n\n"
+                        f"Recent invoices (most recent last):\n{inv_text}"
+                    )
                 except:
                     pass
 
