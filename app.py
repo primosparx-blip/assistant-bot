@@ -705,22 +705,34 @@ def telegram_webhook():
             email_ctx = ""
             cal_ctx   = ""
 
-            email_kws = ["email","inbox","mail","message","received","sent","subject","unread","from","recent"]
+            email_kws = ["email","inbox","mail","message","received","sent","subject","unread","from","recent","receipt","invoice","order","payment","apple","booking"]
             if any(w in text_l for w in email_kws):
                 try:
-                    emails = get_unread_emails(5)
-                    if emails:
+                    from googleapiclient.discovery import build as gbuild
+                    svc = gbuild("gmail", "v1", credentials=get_google_creds())
+                    # Search all inbox, not just unread
+                    query = "in:inbox"
+                    # If asking about specific vendor, add to search
+                    for word in text.split():
+                        if len(word) > 3 and word.lower() not in ["what","is","my","the","from","have","any","did","get","for","that","this","your","can","you","see"]:
+                            query = "in:inbox " + word
+                            break
+                    res  = svc.users().messages().list(userId="me", q=query, maxResults=10).execute()
+                    msgs = res.get("messages", [])
+                    if msgs:
                         lines = []
-                        for em in emails:
-                            sf = em["from"][:40].replace('"','').replace("\n","")
-                            ss = em["subject"][:60].replace('"','').replace("\n","")
-                            sp = em["snippet"][:80].replace('"','').replace("\n","")
+                        for m in msgs[:5]:
+                            d = svc.users().messages().get(userId="me", id=m["id"], format="metadata", metadataHeaders=["From","Subject","Date"]).execute()
+                            h = {x["name"]:x["value"] for x in d["payload"]["headers"]}
+                            sf = h.get("From","")[:40].replace('"','').replace("\n","")
+                            ss = h.get("Subject","")[:60].replace('"','').replace("\n","")
+                            sp = d.get("snippet","")[:100].replace('"','').replace("\n","")
                             lines.append("From: " + sf + " Subject: " + ss + " Preview: " + sp)
-                        email_ctx = " Unread emails: " + " | ".join(lines)
+                        email_ctx = " Emails found: " + " || ".join(lines)
                     else:
-                        email_ctx = " Inbox is empty."
+                        email_ctx = " No emails found matching that search."
                 except Exception as e:
-                    email_ctx = " Email error: " + str(e)[:50]
+                    email_ctx = " Email error: " + str(e)[:80]
 
             cal_kws = ["calendar","schedule","meeting","today","tomorrow","event","appointment"]
             if any(w in text_l for w in cal_kws):
