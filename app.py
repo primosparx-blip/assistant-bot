@@ -701,18 +701,47 @@ def telegram_webhook():
                 send_message(chat_id, "Error: " + str(e)[:100], parse_mode="")
 
         else:
-            # Natural language — fetch accounting data for context
-            acct_ctx = get_accounting_context()
+            acct_ctx  = get_accounting_context()
+            email_ctx = ""
+            cal_ctx   = ""
+
+            email_kws = ["email","inbox","mail","message","received","sent","subject","unread","from","recent"]
+            if any(w in text_l for w in email_kws):
+                try:
+                    emails = get_unread_emails(5)
+                    if emails:
+                        lines = []
+                        for em in emails:
+                            sf = em["from"][:40].replace('"','').replace("\n","")
+                            ss = em["subject"][:60].replace('"','').replace("\n","")
+                            sp = em["snippet"][:80].replace('"','').replace("\n","")
+                            lines.append("From: " + sf + " Subject: " + ss + " Preview: " + sp)
+                        email_ctx = " Unread emails: " + " | ".join(lines)
+                    else:
+                        email_ctx = " Inbox is empty."
+                except Exception as e:
+                    email_ctx = " Email error: " + str(e)[:50]
+
+            cal_kws = ["calendar","schedule","meeting","today","tomorrow","event","appointment"]
+            if any(w in text_l for w in cal_kws):
+                try:
+                    events = get_todays_events()
+                    if events:
+                        cal_ctx = " Today calendar: " + " | ".join([format_event(e) for e in events[:5]])
+                    else:
+                        cal_ctx = " No events today."
+                except Exception as e:
+                    cal_ctx = " Calendar error: " + str(e)[:50]
+
             response = claude.messages.create(
                 model="claude-sonnet-4-5",
                 max_tokens=400,
                 messages=[{"role":"user","content":
                     "You are George's personal business assistant in Trinidad. "
                     "The user said: " + text +
-                    acct_ctx +
-                    "\n\nAnswer directly using the data. Use TTD for currency. "
-                    "Do partial vendor name matching. Never say you don't have access to data. "
-                    "Be concise."
+                    acct_ctx + email_ctx + cal_ctx +
+                    " Answer directly using the data. Use TTD for currency. "
+                    "Never say you lack access to data. Be concise."
                 }]
             )
             send_message(chat_id, response.content[0].text, parse_mode="")
