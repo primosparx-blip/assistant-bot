@@ -105,7 +105,7 @@ def scan_emails_for_receipts(days=10):
     print("Starting email scan for last " + str(days) + " days")
     service = get_gmail_service()
     
-    query = "subject:(receipt OR invoice OR payment OR confirmation OR booking OR order) newer_than:" + str(days) + "d"
+    query = "from:(transactionalerts@jmmb.com OR receipt OR invoice OR noreply) newer_than:" + str(days) + "d"
     print("Gmail query: " + query)
     
     results = service.users().messages().list(
