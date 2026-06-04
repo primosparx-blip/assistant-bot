@@ -76,14 +76,14 @@ def get_unread_emails(max_results=5):
         })
     return emails
 
-def get_email_body(service, msg_id):
-    """Fetch full email body text."""
+def get_email_full(service, msg_id):
+    """Fetch full email including body text and attachment info."""
     try:
-        detail = service.users().messages().get(
+        detail  = service.users().messages().get(
             userId="me", id=msg_id, format="full"
         ).execute()
         payload = detail.get("payload", {})
-        
+
         def extract_text(part):
             if part.get("mimeType") == "text/plain":
                 data = part.get("body", {}).get("data", "")
@@ -95,10 +95,74 @@ def get_email_body(service, msg_id):
                 if result:
                     return result
             return ""
-        
-        return extract_text(payload)[:3000]
-    except:
+
+        def extract_attachments(part, attachments=None):
+            if attachments is None:
+                attachments = []
+            filename = part.get("filename","")
+            if filename:
+                attachments.append({
+                    "filename":      filename,
+                    "mimeType":      part.get("mimeType",""),
+                    "attachment_id": part.get("body",{}).get("attachmentId",""),
+                    "size":          part.get("body",{}).get("size",0)
+                })
+            for sub in part.get("parts", []):
+                extract_attachments(sub, attachments)
+            return attachments
+
+        body        = extract_text(payload)[:3000]
+        attachments = extract_attachments(payload)
+        return body, attachments
+    except Exception as e:
+        return "", []
+
+def get_email_body(service, msg_id):
+    body, _ = get_email_full(service, msg_id)
+    return body
+
+def download_attachment(service, msg_id, attachment_id, filename):
+    """Download an email attachment and return base64 data."""
+    try:
+        att = service.users().messages().attachments().get(
+            userId="me", messageId=msg_id, id=attachment_id
+        ).execute()
+        return att.get("data","")
+    except Exception as e:
         return ""
+
+def find_email_with_attachment(subject_hint, sender_hint="", days=7):
+    """Search for an email with a specific subject and return its attachments."""
+    try:
+        svc   = get_gmail_service()
+        query = "in:inbox has:attachment newer_than:" + str(days) + "d"
+        if subject_hint:
+            query += " subject:" + subject_hint
+        if sender_hint:
+            query += " from:" + sender_hint
+
+        res  = svc.users().messages().list(userId="me", q=query, maxResults=5).execute()
+        msgs = res.get("messages", [])
+        results = []
+
+        for m in msgs:
+            d = svc.users().messages().get(
+                userId="me", id=m["id"], format="metadata",
+                metadataHeaders=["From","Subject","Date"]
+            ).execute()
+            h    = {x["name"]:x["value"] for x in d["payload"]["headers"]}
+            body, attachments = get_email_full(svc, m["id"])
+            results.append({
+                "id":          m["id"],
+                "from":        h.get("From",""),
+                "subject":     h.get("Subject",""),
+                "date":        h.get("Date",""),
+                "body":        body[:500],
+                "attachments": attachments
+            })
+        return results
+    except Exception as e:
+        return []
 
 def scan_emails_for_receipts(days=10):
     """Scan Gmail for receipts and invoices from the past N days."""
