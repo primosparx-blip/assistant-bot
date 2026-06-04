@@ -76,14 +76,14 @@ def get_unread_emails(max_results=5):
         })
     return emails
 
-def get_email_full(service, msg_id):
-    """Fetch full email including body text and attachment info."""
+def get_email_body(service, msg_id):
+    """Fetch full email body text."""
     try:
-        detail  = service.users().messages().get(
+        detail = service.users().messages().get(
             userId="me", id=msg_id, format="full"
         ).execute()
         payload = detail.get("payload", {})
-
+        
         def extract_text(part):
             if part.get("mimeType") == "text/plain":
                 data = part.get("body", {}).get("data", "")
@@ -95,81 +95,17 @@ def get_email_full(service, msg_id):
                 if result:
                     return result
             return ""
-
-        def extract_attachments(part, attachments=None):
-            if attachments is None:
-                attachments = []
-            filename = part.get("filename","")
-            if filename:
-                attachments.append({
-                    "filename":      filename,
-                    "mimeType":      part.get("mimeType",""),
-                    "attachment_id": part.get("body",{}).get("attachmentId",""),
-                    "size":          part.get("body",{}).get("size",0)
-                })
-            for sub in part.get("parts", []):
-                extract_attachments(sub, attachments)
-            return attachments
-
-        body        = extract_text(payload)[:3000]
-        attachments = extract_attachments(payload)
-        return body, attachments
-    except Exception as e:
-        return "", []
-
-def get_email_body(service, msg_id):
-    body, _ = get_email_full(service, msg_id)
-    return body
-
-def download_attachment(service, msg_id, attachment_id, filename):
-    """Download an email attachment and return base64 data."""
-    try:
-        att = service.users().messages().attachments().get(
-            userId="me", messageId=msg_id, id=attachment_id
-        ).execute()
-        return att.get("data","")
-    except Exception as e:
+        
+        return extract_text(payload)[:3000]
+    except:
         return ""
-
-def find_email_with_attachment(subject_hint, sender_hint="", days=7):
-    """Search for an email with a specific subject and return its attachments."""
-    try:
-        svc   = get_gmail_service()
-        query = "in:inbox has:attachment newer_than:" + str(days) + "d"
-        if subject_hint:
-            query += " subject:" + subject_hint
-        if sender_hint:
-            query += " from:" + sender_hint
-
-        res  = svc.users().messages().list(userId="me", q=query, maxResults=5).execute()
-        msgs = res.get("messages", [])
-        results = []
-
-        for m in msgs:
-            d = svc.users().messages().get(
-                userId="me", id=m["id"], format="metadata",
-                metadataHeaders=["From","Subject","Date"]
-            ).execute()
-            h    = {x["name"]:x["value"] for x in d["payload"]["headers"]}
-            body, attachments = get_email_full(svc, m["id"])
-            results.append({
-                "id":          m["id"],
-                "from":        h.get("From",""),
-                "subject":     h.get("Subject",""),
-                "date":        h.get("Date",""),
-                "body":        body[:500],
-                "attachments": attachments
-            })
-        return results
-    except Exception as e:
-        return []
 
 def scan_emails_for_receipts(days=10):
     """Scan Gmail for receipts and invoices from the past N days."""
     print("Starting email scan for last " + str(days) + " days")
     service = get_gmail_service()
     
-    query = ("from:(transactionalerts@jmmb.com OR ttrideshare OR rideshare) OR ""subject:(receipt OR invoice OR payment OR transaction OR summary OR ride OR order OR confirmation) ""newer_than:" + str(days) + "d")
+    query = "subject:(receipt OR invoice OR payment OR confirmation OR booking OR order) newer_than:" + str(days) + "d"
     print("Gmail query: " + query)
     
     results = service.users().messages().list(
@@ -765,71 +701,18 @@ def telegram_webhook():
                 send_message(chat_id, "Error: " + str(e)[:100], parse_mode="")
 
         else:
-            acct_ctx  = get_accounting_context()
-            email_ctx = ""
-            cal_ctx   = ""
-
-            email_kws = ["email","inbox","mail","message","received","sent","subject","unread","from","recent","receipt","invoice","order","payment","apple","booking"]
-            if any(w in text_l for w in email_kws):
-                try:
-                    from googleapiclient.discovery import build as gbuild
-                    svc = gbuild("gmail", "v1", credentials=get_google_creds())
-                    # Search all inbox, not just unread
-                    query = "in:inbox"
-                    # If asking about specific vendor, add to search
-                    for word in text.split():
-                        if len(word) > 3 and word.lower() not in ["what","is","my","the","from","have","any","did","get","for","that","this","your","can","you","see"]:
-                            query = "in:inbox " + word
-                            break
-                    res  = svc.users().messages().list(userId="me", q=query, maxResults=10).execute()
-                    msgs = res.get("messages", [])
-                    if msgs:
-                        lines = []
-                        for m in msgs[:5]:
-                            d = svc.users().messages().get(userId="me", id=m["id"], format="metadata", metadataHeaders=["From","Subject","Date"]).execute()
-                            h = {x["name"]:x["value"] for x in d["payload"]["headers"]}
-                            sf = h.get("From","")[:40].replace('"','').replace("\n","")
-                            ss = h.get("Subject","")[:60].replace('"','').replace("\n","")
-                            sp = d.get("snippet","")[:100].replace('"','').replace("\n","")
-                            lines.append("From: " + sf + " Subject: " + ss + " Preview: " + sp)
-                        email_ctx = " Emails found: " + " || ".join(lines)
-                    else:
-                        email_ctx = " No emails found matching that search."
-                except Exception as e:
-                    email_ctx = " Email error: " + str(e)[:80]
-
-            cal_kws = ["calendar","schedule","meeting","today","tomorrow","event","appointment"]
-            if any(w in text_l for w in cal_kws):
-                try:
-                    events = get_todays_events()
-                    if events:
-                        cal_ctx = " Today calendar: " + " | ".join([format_event(e) for e in events[:5]])
-                    else:
-                        cal_ctx = " No events today."
-                except Exception as e:
-                    cal_ctx = " Calendar error: " + str(e)[:50]
-
-            system_prompt = (
-                "You are Primo, George Solomon's highly intelligent personal business assistant based in Trinidad and Tobago. "
-                "George owns a restaurant business and uses you daily to manage his operations. "
-                "Your personality: sharp, warm, proactive, direct. You speak like a trusted advisor, not a chatbot. "
-                "You remember context within this conversation and connect the dots between topics. "
-                "You have access to George's Gmail (georgejgsolomon@gmail.com), Google Calendar, and accounting data. "
-                "When George asks about emails, you search and read them. When he asks about expenses, you check the sheet. "
-                "When something seems off or worth flagging, mention it proactively. "
-                "Use TTD for local currency. Always be specific with numbers and dates. "
-                "Never say you lack access to data — just fetch it and answer. "
-                "If you need to do something, say what you are doing. "
-                "Keep responses focused and conversational — not bullet-pointed unless it helps clarity. "
-                "You know George's regular suppliers: Hadco, Trinidad Seafoods, A.S. Bryden, MoreVino/MoreSushi. "
-                "His bank is JMMB and he uses TT RideShare for transport."
-            )
+            # Natural language — fetch accounting data for context
+            acct_ctx = get_accounting_context()
             response = claude.messages.create(
                 model="claude-sonnet-4-5",
-                max_tokens=600,
-                system=system_prompt,
+                max_tokens=400,
                 messages=[{"role":"user","content":
-                    text + acct_ctx + email_ctx + cal_ctx
+                    "You are George's personal business assistant in Trinidad. "
+                    "The user said: " + text +
+                    acct_ctx +
+                    "\n\nAnswer directly using the data. Use TTD for currency. "
+                    "Do partial vendor name matching. Never say you don't have access to data. "
+                    "Be concise."
                 }]
             )
             send_message(chat_id, response.content[0].text, parse_mode="")
