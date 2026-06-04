@@ -44,8 +44,19 @@ def get_google_creds():
         with open("token.json") as f:
             token_data = json.load(f)
     creds = Credentials.from_authorized_user_info(token_data, SCOPES)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+    # Always try to refresh — token may be expired
+    try:
+        if not creds.valid:
+            creds.refresh(Request())
+        elif creds.expired:
+            creds.refresh(Request())
+    except Exception as e:
+        print("Token refresh error: " + str(e))
+        # Force refresh anyway
+        try:
+            creds.refresh(Request())
+        except:
+            pass
     return creds
 
 def get_gmail_service():
