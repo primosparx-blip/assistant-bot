@@ -1,793 +1,403 @@
 """
-PrimoAssistanttBot - Telegram Personal Assistant
-Commander agent with daily briefings, Gmail, Calendar, and business lessons
+WhatsApp Accounting Agent — Full Version with SendGrid
 """
-import os, json, base64, datetime, hashlib, requests, traceback, threading, time
-from flask import Flask, request, jsonify
+import os, json, base64, datetime, requests, traceback
+from flask import Flask, request
+from twilio.rest import Client
+from twilio.twiml.messaging_response import MessagingResponse
 import anthropic
+import gspread
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from email.mime.text import MIMEText
+import threading, time
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 app = Flask(__name__)
 
-# In-memory conversation history per user (last 10 messages)
-conversation_history = {}
-
-def get_history(chat_id):
-    return conversation_history.get(str(chat_id), [])
-
-def add_to_history(chat_id, role, content):
-    key = str(chat_id)
-    if key not in conversation_history:
-        conversation_history[key] = []
-    conversation_history[key].append({"role": role, "content": content})
-    # Keep only last 10 exchanges (20 messages)
-    if len(conversation_history[key]) > 20:
-        conversation_history[key] = conversation_history[key][-20:]
-
-TELEGRAM_TOKEN     = os.environ["ASSISTANT_BOT_TOKEN"]
-ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
-GOOGLE_TOKEN_JSON  = os.environ.get("GOOGLE_TOKEN_JSON", "")
-ACCOUNTING_API_URL = os.environ.get("ACCOUNTING_API_URL", "")
-OWNER_CHAT_ID      = os.environ.get("OWNER_CHAT_ID", "")
-TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+TWILIO_SID        = os.environ["TWILIO_SID"]
+TWILIO_TOKEN      = os.environ["TWILIO_TOKEN"]
+TWILIO_WA_NUM     = os.environ.get("TWILIO_WHATSAPP_NUM", "whatsapp:+14155238886")
+SHEET_ID          = os.environ.get("SHEET_ID", "1mity1H5znYDITK9QLYORYD-UGt689LmY-fS29m13VLE")
+GOOGLE_TOKEN_JSON = os.environ.get("GOOGLE_TOKEN_JSON", "")
+REPORT_EMAIL      = os.environ.get("REPORT_EMAIL", "georgejgsolomon@gmail.com")
+SENDGRID_API_KEY  = os.environ.get("SENDGRID_API_KEY", "")
+SENDGRID_FROM     = os.environ.get("SENDGRID_FROM", "georgejgsolomon@gmail.com")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+twilio = Client(TWILIO_SID, TWILIO_TOKEN)
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/calendar"
-]
+EXTRACT_PROMPT = """
+You are an accounting AI. Analyze this invoice/bill image and extract fields.
+Return ONLY valid JSON — no markdown, no explanation.
+{
+  "vendor":         "Company name on the invoice",
+  "invoice_date":   "YYYY-MM-DD",
+  "invoice_number": "Invoice reference number or N/A",
+  "description":    "Brief description (max 40 chars)",
+  "category":       "One of: Office Supplies | Software/Cloud | Shipping | Facilities | Marketing | Travel | Utilities | Professional Services | Food & Entertainment | Other",
+  "currency":       "USD",
+  "amount":         123.45,
+  "tax":            12.34,
+  "confidence":     "high | medium | low"
+}
+If a numeric field cannot be read use 0. If text cannot be read use Unknown.
+"""
 
-BUSINESS_CONCEPTS = [
-    "opportunity cost", "cash flow", "gross margin", "EBITDA",
-    "working capital", "accounts receivable", "break even point", "return on investment",
-    "cost of goods sold", "net profit margin", "liquidity", "economies of scale",
-    "fixed vs variable costs", "price elasticity", "brand equity",
-    "customer lifetime value", "churn rate", "gross profit",
-    "overheads", "markup vs margin", "debtors and creditors",
-    "accounts payable", "depreciation", "inventory turnover", "profit margin"
-]
+SHEET_HEADERS = ["ID","Date Received","Invoice Date","Invoice #","Vendor",
+                 "Description","Category","Currency","Amount","Tax","Total","Status","WA Msg ID"]
 
-def get_google_creds():
+def get_gspread_client():
+    SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
     if GOOGLE_TOKEN_JSON:
         token_data = json.loads(GOOGLE_TOKEN_JSON)
     else:
         with open("token.json") as f:
             token_data = json.load(f)
     creds = Credentials.from_authorized_user_info(token_data, SCOPES)
-    # Always try to refresh — token may be expired
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    return gspread.authorize(creds)
+
+def get_or_create_sheet(sh, title, headers):
     try:
-        if not creds.valid:
-            creds.refresh(Request())
-        elif creds.expired:
-            creds.refresh(Request())
-    except Exception as e:
-        print("Token refresh error: " + str(e))
-        # Force refresh anyway
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=1000, cols=len(headers))
+        ws.append_row(headers)
+    if ws.row_values(1) != headers:
+        ws.insert_row(headers, 1)
+    return ws
+
+def get_all_invoices(sh):
+    ws = get_or_create_sheet(sh, "Invoice Log", SHEET_HEADERS)
+    return ws.get_all_records()
+
+def refresh_summaries(sh):
+    rows = get_all_invoices(sh)
+    if not rows:
+        return
+
+    cat_data = {}
+    for r in rows:
+        cat = r.get("Category", "Other") or "Other"
+        amt = float(r.get("Amount", 0) or 0)
+        tax = float(r.get("Tax", 0) or 0)
+        if cat not in cat_data:
+            cat_data[cat] = {"count": 0, "amount": 0, "tax": 0}
+        cat_data[cat]["count"]  += 1
+        cat_data[cat]["amount"] += amt
+        cat_data[cat]["tax"]    += tax
+
+    total_spend = sum(v["amount"] for v in cat_data.values()) or 1
+    cat_headers = ["Category","Invoice Count","Subtotal","Tax","Total","% of Spend"]
+    ws_cat = get_or_create_sheet(sh, "Category Summary", cat_headers)
+    ws_cat.clear()
+    ws_cat.append_row(cat_headers)
+    for cat, v in sorted(cat_data.items(), key=lambda x: -x[1]["amount"]):
+        total = v["amount"] + v["tax"]
+        pct   = round((v["amount"] / total_spend) * 100, 1)
+        ws_cat.append_row([cat, v["count"], round(v["amount"],2),
+                           round(v["tax"],2), round(total,2), f"{pct}%"])
+
+    month_data = {}
+    for r in rows:
+        date_str = r.get("Invoice Date","") or r.get("Date Received","")
         try:
-            creds.refresh(Request())
+            month = str(date_str)[:7]
+        except:
+            month = "Unknown"
+        amt = float(r.get("Amount", 0) or 0)
+        tax = float(r.get("Tax", 0) or 0)
+        if month not in month_data:
+            month_data[month] = {"count": 0, "amount": 0, "tax": 0}
+        month_data[month]["count"]  += 1
+        month_data[month]["amount"] += amt
+        month_data[month]["tax"]    += tax
+
+    month_headers = ["Month","Invoice Count","Subtotal","Tax","Total"]
+    ws_month = get_or_create_sheet(sh, "Monthly Summary", month_headers)
+    ws_month.clear()
+    ws_month.append_row(month_headers)
+    for month, v in sorted(month_data.items()):
+        ws_month.append_row([month, v["count"], round(v["amount"],2),
+                             round(v["tax"],2), round(v["amount"]+v["tax"],2)])
+
+def append_to_sheet(data, wa_msg_id):
+    gc     = get_gspread_client()
+    sh     = gc.open_by_key(SHEET_ID)
+    ws     = get_or_create_sheet(sh, "Invoice Log", SHEET_HEADERS)
+    rows   = ws.get_all_values()
+    inv_id = f"INV-{len(rows):03d}"
+    today  = datetime.date.today().strftime("%Y-%m-%d")
+    amount = float(data.get("amount", 0))
+    tax    = float(data.get("tax", 0))
+    row = [
+        inv_id, today,
+        data.get("invoice_date", today),
+        data.get("invoice_number", "N/A"),
+        data.get("vendor", "Unknown"),
+        data.get("description", ""),
+        data.get("category", "Other"),
+        data.get("currency", "USD"),
+        amount, tax,
+        round(amount + tax, 2),
+        "Pending",
+        wa_msg_id
+    ]
+    ws.append_row(row)
+    refresh_summaries(sh)
+    return inv_id
+
+def build_summary_text(rows, period_label="All Time"):
+    if not rows:
+        return f"No invoices found for {period_label}."
+    total_amt  = sum(float(r.get("Amount",0) or 0) for r in rows)
+    total_tax  = sum(float(r.get("Tax",0) or 0) for r in rows)
+    total      = total_amt + total_tax
+    cat_totals = {}
+    for r in rows:
+        cat = r.get("Category","Other") or "Other"
+        cat_totals[cat] = cat_totals.get(cat,0) + float(r.get("Amount",0) or 0)
+    top_cats = sorted(cat_totals.items(), key=lambda x: -x[1])[:5]
+    lines = [
+        f"📊 *{period_label} Summary*",
+        f"📋 Invoices: {len(rows)}",
+        f"💵 Subtotal: ${total_amt:,.2f}",
+        f"🧾 Tax: ${total_tax:,.2f}",
+        f"💰 Total: ${total:,.2f}",
+        "",
+        "📂 *Top Categories:*"
+    ]
+    for cat, amt in top_cats:
+        lines.append(f"  • {cat}: ${amt:,.2f}")
+    return "\n".join(lines)
+
+def get_weekly_rows(rows):
+    today    = datetime.date.today()
+    week_ago = today - datetime.timedelta(days=7)
+    result   = []
+    for r in rows:
+        try:
+            d = datetime.date.fromisoformat(str(r.get("Date Received",""))[:10])
+            if d >= week_ago:
+                result.append(r)
         except:
             pass
-    return creds
+    return result
 
-def get_gmail_service():
-    return build("gmail", "v1", credentials=get_google_creds())
+def get_monthly_rows(rows):
+    month = datetime.date.today().strftime("%Y-%m")
+    return [r for r in rows if str(r.get("Date Received","")).startswith(month)]
 
-def get_calendar_service():
-    return build("calendar", "v3", credentials=get_google_creds())
+def send_weekly_email(rows):
+    if not SENDGRID_API_KEY:
+        print("SendGrid not configured — skipping email")
+        return
 
-def get_unread_emails(max_results=5):
-    service = get_gmail_service()
-    results = service.users().messages().list(
-        userId="me", labelIds=["INBOX","UNREAD"], maxResults=max_results
-    ).execute()
-    messages = results.get("messages", [])
-    emails = []
-    for msg in messages:
-        detail = service.users().messages().get(
-            userId="me", id=msg["id"], format="metadata",
-            metadataHeaders=["From","Subject","Date"]
-        ).execute()
-        headers = {h["name"]:h["value"] for h in detail["payload"]["headers"]}
-        emails.append({
-            "id": msg["id"],
-            "from": headers.get("From",""),
-            "subject": headers.get("Subject",""),
-            "date": headers.get("Date",""),
-            "snippet": detail.get("snippet","")[:120]
-        })
-    return emails
+    weekly      = get_weekly_rows(rows)
+    monthly     = get_monthly_rows(rows)
+    week_total  = sum(float(r.get("Amount",0) or 0)+float(r.get("Tax",0) or 0) for r in weekly)
+    month_total = sum(float(r.get("Amount",0) or 0)+float(r.get("Tax",0) or 0) for r in monthly)
 
-def get_email_body(service, msg_id):
-    """Fetch full email body text."""
-    try:
-        detail = service.users().messages().get(
-            userId="me", id=msg_id, format="full"
-        ).execute()
-        payload = detail.get("payload", {})
-        
-        def extract_text(part):
-            if part.get("mimeType") == "text/plain":
-                data = part.get("body", {}).get("data", "")
-                if data:
-                    import base64
-                    return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-            for sub in part.get("parts", []):
-                result = extract_text(sub)
-                if result:
-                    return result
-            return ""
-        
-        return extract_text(payload)[:3000]
-    except:
-        return ""
+    rows_html = ""
+    for i, r in enumerate(weekly):
+        bg  = "#F5F5FC" if i%2==0 else "#EAEAF5"
+        amt = float(r.get("Amount",0) or 0) + float(r.get("Tax",0) or 0)
+        rows_html += (
+            f'<tr style="background:{bg}">'
+            f'<td style="padding:8px">{r.get("Vendor","")}</td>'
+            f'<td style="padding:8px">{r.get("Category","")}</td>'
+            f'<td style="padding:8px">{r.get("Date Received","")}</td>'
+            f'<td style="padding:8px">${amt:,.2f}</td></tr>'
+        )
 
-def scan_emails_for_receipts(days=10):
-    """Scan Gmail for receipts and invoices from the past N days."""
-    print("Starting email scan for last " + str(days) + " days")
-    service = get_gmail_service()
-    
-    query = "subject:(receipt OR invoice OR payment OR confirmation OR booking OR order) newer_than:" + str(days) + "d"
-    print("Gmail query: " + query)
-    
-    results = service.users().messages().list(
-        userId="me", q=query, maxResults=30
-    ).execute()
-    
-    messages = results.get("messages", [])
-    print("Found " + str(len(messages)) + " emails matching query")
-    receipts = []
-    
-    for msg in messages:
-        try:
-            detail  = service.users().messages().get(
-                userId="me", id=msg["id"], format="metadata",
-                metadataHeaders=["From","Subject","Date"]
-            ).execute()
-            headers = {h["name"]:h["value"] for h in detail["payload"]["headers"]}
-            body    = get_email_body(service, msg["id"])
-            subject = headers.get("Subject","")
-            sender  = headers.get("From","")
-            print("Email: " + subject + " from " + sender)
-            receipts.append({
-                "id":      msg["id"],
-                "from":    sender,
-                "subject": subject,
-                "date":    headers.get("Date",""),
-                "body":    body
-            })
-        except Exception as e:
-            print("Error reading email: " + str(e))
-    
-    return receipts
+    # Category breakdown
+    cat_totals = {}
+    for r in rows:
+        cat = r.get("Category","Other") or "Other"
+        cat_totals[cat] = cat_totals.get(cat,0) + float(r.get("Amount",0) or 0)
+    cat_rows = ""
+    for cat, amt in sorted(cat_totals.items(), key=lambda x: -x[1]):
+        cat_rows += f'<tr><td style="padding:6px">{cat}</td><td style="padding:6px">${amt:,.2f}</td></tr>'
 
-def extract_invoice_from_email(email):
-    """Use Claude to extract invoice data from email content."""
-    email_text = (
-        "From: " + email["from"] + " Subject: " + email["subject"] +
-        " Date: " + email["date"] + " Body: " + email["body"][:2000]
+    html = f"""
+    <html><body style="font-family:Arial,sans-serif;max-width:620px;margin:auto;padding:20px;color:#222">
+    <div style="background:#0A0A1A;padding:24px;border-radius:8px;margin-bottom:24px">
+      <h2 style="color:#00FFB3;margin:0">📊 Weekly Accounting Report</h2>
+      <p style="color:#888;margin:8px 0 0">{datetime.date.today().strftime('%B %d, %Y')} · Accounting Agent</p>
+    </div>
+
+    <h3>🗓 This Week ({len(weekly)} invoices)</h3>
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #ddd">
+    <tr style="background:#1A1A3E;color:white">
+      <th style="padding:10px;text-align:left">Vendor</th>
+      <th style="padding:10px;text-align:left">Category</th>
+      <th style="padding:10px;text-align:left">Date</th>
+      <th style="padding:10px;text-align:left">Total</th>
+    </tr>
+    {rows_html if rows_html else '<tr><td colspan="4" style="padding:10px;color:#888">No invoices this week</td></tr>'}
+    </table>
+    <p style="font-size:16px"><strong>Week Total: ${week_total:,.2f}</strong></p>
+
+    <hr style="border:1px solid #eee">
+    <h3>📅 Month to Date</h3>
+    <p>Invoices logged: <strong>{len(monthly)}</strong> &nbsp;|&nbsp; Total spend: <strong>${month_total:,.2f}</strong></p>
+
+    <hr style="border:1px solid #eee">
+    <h3>📂 All Time by Category</h3>
+    <table width="60%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #ddd">
+    <tr style="background:#1A1A3E;color:white">
+      <th style="padding:8px;text-align:left">Category</th>
+      <th style="padding:8px;text-align:left">Total</th>
+    </tr>
+    {cat_rows}
+    </table>
+
+    <hr style="border:1px solid #eee">
+    <p style="color:#aaa;font-size:12px">Sent automatically every Monday 8am · Accounting Agent</p>
+    </body></html>
+    """
+
+    message = Mail(
+        from_email=SENDGRID_FROM,
+        to_emails=REPORT_EMAIL,
+        subject=f"📊 Weekly Accounting Report — {datetime.date.today().strftime('%b %d, %Y')}",
+        html_content=html
     )
-    instruction = (
-        "You are an accounting AI. Extract invoice/receipt data from this email. "
-        + email_text +
-        " Return ONLY valid JSON or the word SKIP if not a receipt: "
-        '{"vendor":"Company name","invoice_date":"YYYY-MM-DD","invoice_number":"ref or N/A",'
-        '"description":"brief description","category":"Food & Entertainment or Travel or '
-        'Software/Cloud or Utilities or Professional Services or Other",'
-        '"currency":"TTD","amount":0.00,"tax":0.00,"confidence":"high or medium or low"}'
-    )
-    resp = claude.messages.create(
+    sg = SendGridAPIClient(SENDGRID_API_KEY)
+    sg.send(message)
+    print(f"Report sent to {REPORT_EMAIL}")
+
+def weekly_scheduler():
+    while True:
+        now = datetime.datetime.utcnow()
+        if now.weekday() == 0 and now.hour == 12 and now.minute < 5:
+            try:
+                gc   = get_gspread_client()
+                sh   = gc.open_by_key(SHEET_ID)
+                rows = get_all_invoices(sh)
+                send_weekly_email(rows)
+            except Exception as e:
+                print(f"Scheduler error: {e}")
+            time.sleep(360)
+        time.sleep(60)
+
+def fetch_image_b64(media_url):
+    resp = requests.get(media_url, auth=(TWILIO_SID, TWILIO_TOKEN), timeout=20)
+    resp.raise_for_status()
+    media_type = resp.headers.get("Content-Type","image/jpeg").split(";")[0]
+    return base64.standard_b64encode(resp.content).decode("utf-8"), media_type
+
+def extract_invoice(image_b64, media_type):
+    message = claude.messages.create(
         model="claude-sonnet-4-5",
-        max_tokens=300,
-        messages=[{"role": "user", "content": instruction}]
+        max_tokens=512,
+        messages=[{"role":"user","content":[
+            {"type":"image","source":{"type":"base64","media_type":media_type,"data":image_b64}},
+            {"type":"text","text":EXTRACT_PROMPT}
+        ]}]
     )
-    raw = resp.content[0].text.strip()
-    if raw.upper().startswith("SKIP") or raw == "":
-        return None
+    raw = message.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
-    try:
-        return json.loads(raw)
-    except:
-        return None
-
-def scan_and_log_receipts(days=10):
-    """Scan emails, extract receipts, log to accounting bot, return summary."""
-    emails   = scan_emails_for_receipts(days)
-    logged   = []
-    skipped  = 0
-
-    for email in emails:
-        data = extract_invoice_from_email(email)
-        if not data:
-            skipped += 1
-            continue
-        # Log to accounting bot
-        try:
-            if ACCOUNTING_API_URL:
-                resp = requests.post(
-                    ACCOUNTING_API_URL + "/api/log_invoice",
-                    json={"data": data, "source": "email_scan"},
-                    timeout=15
-                )
-                result = resp.json()
-                if result.get("status") == "ok":
-                    logged.append({
-                        "vendor":  data.get("vendor","Unknown"),
-                        "amount":  data.get("amount",0),
-                        "total":   round(float(data.get("amount",0)) + float(data.get("tax",0)), 2),
-                        "inv_id":  result.get("inv_id",""),
-                        "subject": email["subject"][:50]
-                    })
-        except Exception as e:
-            print("Log error: " + str(e))
-
-    return {"logged": logged, "skipped": skipped, "total_scanned": len(emails)}
-
-
-def send_email(to, subject, body):
-    service  = get_gmail_service()
-    message  = MIMEText(body)
-    message["to"]      = to
-    message["subject"] = subject
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-    service.users().messages().send(userId="me", body={"raw":raw}).execute()
-
-def draft_email_with_claude(instruction):
-    response = claude.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=512,
-        messages=[{"role":"user","content":
-            "Draft a professional email based on this instruction: " + instruction +
-            "\n\nReturn ONLY valid JSON: "
-            '{"to":"email@example.com","subject":"Subject here","body":"Email body here"}'
-        }]
-    )
-    raw = response.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"): raw = raw[4:]
     return json.loads(raw)
 
-def get_todays_events():
-    service = get_calendar_service()
-    now     = datetime.datetime.utcnow()
-    start   = now.replace(hour=0,  minute=0,  second=0).isoformat()  + "Z"
-    end     = now.replace(hour=23, minute=59, second=59).isoformat() + "Z"
-    result  = service.events().list(
-        calendarId="primary", timeMin=start, timeMax=end,
-        singleEvents=True, orderBy="startTime"
-    ).execute()
-    return result.get("items", [])
+@app.route("/whatsapp", methods=["POST"])
+def whatsapp_webhook():
+    num_media = int(request.form.get("NumMedia", 0))
+    msg_sid   = request.form.get("MessageSid", "unknown")
+    body_text = request.form.get("Body", "").strip().lower()
+    resp      = MessagingResponse()
 
-def get_weeks_events():
-    service = get_calendar_service()
-    now     = datetime.datetime.utcnow()
-    start   = now.isoformat() + "Z"
-    end     = (now + datetime.timedelta(days=7)).isoformat() + "Z"
-    result  = service.events().list(
-        calendarId="primary", timeMin=start, timeMax=end,
-        singleEvents=True, orderBy="startTime", maxResults=20
-    ).execute()
-    return result.get("items", [])
-
-def create_calendar_event(summary, start_dt, end_dt, description=""):
-    service = get_calendar_service()
-    event   = {
-        "summary":     summary,
-        "description": description,
-        "start": {"dateTime": start_dt.isoformat(), "timeZone": "America/Port_of_Spain"},
-        "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "America/Port_of_Spain"},
-    }
-    return service.events().insert(calendarId="primary", body=event).execute()
-
-def parse_event_with_claude(instruction):
-    today = datetime.date.today().isoformat()
-    response = claude.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=256,
-        messages=[{"role":"user","content":
-            "Today is " + today + ". Parse this scheduling request: '" + instruction + "'\n\n"
-            'Return ONLY valid JSON: {"summary":"Event title","date":"YYYY-MM-DD",'
-            '"start_time":"HH:MM","duration_hours":1,"description":""}\n'
-            "Use 24hr time. Default duration 1 hour if not mentioned."
-        }]
-    )
-    raw = response.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"): raw = raw[4:]
-    return json.loads(raw)
-
-def format_event(event):
-    start    = event.get("start", {})
-    time_str = start.get("dateTime","") or start.get("date","")
-    try:
-        dt       = datetime.datetime.fromisoformat(time_str.replace("Z",""))
-        dt_local = dt - datetime.timedelta(hours=4)
-        time_str = dt_local.strftime("%I:%M %p")
-    except:
-        pass
-    return "  - " + event.get("summary","No title") + " at " + time_str
-
-def get_daily_lesson():
-    today_str = datetime.date.today().isoformat()
-    idx       = int(hashlib.md5(today_str.encode()).hexdigest(), 16) % len(BUSINESS_CONCEPTS)
-    concept   = BUSINESS_CONCEPTS[idx]
-    prompt    = (
-        "Explain the business concept of " + concept + " in 2-3 simple sentences. "
-        "Use a practical example a restaurant owner in Trinidad would relate to. "
-        "Keep it under 60 words. Do not use any markdown formatting."
-    )
-    resp = claude.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=120,
-        messages=[{"role":"user","content": prompt}]
-    )
-    return "Today's Business Lesson: " + concept.title() + "\n\n" + resp.content[0].text
-
-def get_accounting_context():
-    if not ACCOUNTING_API_URL:
-        return ""
-    try:
-        sum_r  = requests.get(ACCOUNTING_API_URL + "/api/summary", timeout=10)
-        inv_r  = requests.get(ACCOUNTING_API_URL + "/api/invoices?limit=50", timeout=10)
-        sdata  = sum_r.json()
-        idata  = inv_r.json()
-        if sdata.get("status") != "ok":
-            return ""
-        invoices  = idata.get("invoices", [])
-        inv_lines = []
-        for inv in invoices:
-            inv_lines.append(
-                "ID:" + str(inv.get("ID","")) + " | " +
-                str(inv.get("Date Received","")) + " | " +
-                str(inv.get("Vendor","")) + " | " +
-                str(inv.get("Category","")) + " | TTD " +
-                str(inv.get("Amount",0)) + " | Tax: TTD " +
-                str(inv.get("Tax",0)) + " | Total: TTD " +
-                str(inv.get("Total",0)) + " | Status: " +
-                str(inv.get("Status",""))
-            )
-        top = ", ".join([
-            c["category"] + ": TTD " + str(round(c["amount"],2))
-            for c in sdata.get("top_categories",[])
-        ])
-        return (
-            "\n\nAccounting data - " +
-            "Total invoices: " + str(sdata.get("total_invoices",0)) + ", " +
-            "Pending: " + str(sdata.get("pending_invoices",0)) + ", " +
-            "This week: TTD " + str(sdata.get("total_spend_this_week",0)) + ", " +
-            "This month: TTD " + str(sdata.get("total_spend_this_month",0)) + ", " +
-            "All time: TTD " + str(sdata.get("total_spend_all_time",0)) + ", " +
-            "Top categories: " + top +
-            "\n\nAll invoices:\n" + "\n".join(inv_lines)
-        )
-    except Exception as e:
-        return ""
-
-def web_search(query):
-    """Search the web using DuckDuckGo instant answer API - no key needed."""
-    try:
-        r = requests.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
-            timeout=10
-        )
-        data = r.json()
-        results = []
-
-        # Abstract (main answer)
-        if data.get("AbstractText"):
-            results.append(data["AbstractText"])
-
-        # Related topics
-        for topic in data.get("RelatedTopics", [])[:3]:
-            if isinstance(topic, dict) and topic.get("Text"):
-                results.append(topic["Text"])
-
-        if results:
-            return " | ".join(results[:3])
-        else:
-            return "No results found for: " + query
-
-    except Exception as e:
-        return "Search error: " + str(e)
-
-def web_search(query):
-    try:
-        r = requests.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
-            timeout=10
-        )
-        data = r.json()
-        results = []
-        if data.get("AbstractText"):
-            results.append(data["AbstractText"])
-        for topic in data.get("RelatedTopics", [])[:3]:
-            if isinstance(topic, dict) and topic.get("Text"):
-                results.append(topic["Text"])
-        return (" ".join(results[:3])) if results else "No results found for: " + query
-    except Exception as e:
-        return "Search error: " + str(e)
-
-
-def get_full_briefing():
-    today    = datetime.datetime.utcnow() - datetime.timedelta(hours=4)
-    hour     = today.hour
-    greeting = "Good morning" if hour < 12 else ("Good afternoon" if hour < 17 else "Good evening")
-    day_str  = today.strftime("%A, %B %d, %Y")
-    lines    = [greeting + " George!", day_str, ""]
-
-    # Calendar
-    try:
-        events = get_todays_events()
-        if events:
-            lines.append("Today's Schedule (" + str(len(events)) + " events):")
-            for e in events[:8]:
-                lines.append(format_event(e))
-        else:
-            lines.append("Calendar: No events today - free day!")
-    except:
-        lines.append("Calendar: unavailable")
-
-    lines.append("")
-
-    # Email
-    try:
-        emails = get_unread_emails(5)
-        if emails:
-            lines.append("Unread Emails (" + str(len(emails)) + "):")
-            for em in emails[:5]:
-                sender  = em["from"].split("<")[0].strip()[:30]
-                subject = em["subject"][:50]
-                lines.append("  - " + sender + ": " + subject)
-        else:
-            lines.append("Email: Inbox clear!")
-    except:
-        lines.append("Email: unavailable")
-
-    lines.append("")
-
-    # Expenses
-    if ACCOUNTING_API_URL:
+    if num_media == 0:
         try:
-            sum_r  = requests.get(ACCOUNTING_API_URL + "/api/summary", timeout=10)
-            inv_r  = requests.get(ACCOUNTING_API_URL + "/api/invoices?limit=5", timeout=10)
-            sdata  = sum_r.json()
-            idata  = inv_r.json()
-            if sdata.get("status") == "ok":
-                lines.append("Expenses:")
-                lines.append("  - This week: TTD " + str(round(sdata.get("total_spend_this_week",0),2)))
-                lines.append("  - This month: TTD " + str(round(sdata.get("total_spend_this_month",0),2)))
-                lines.append("  - Pending invoices: " + str(sdata.get("pending_invoices",0)))
-                top = sdata.get("top_categories",[])
-                if top:
-                    lines.append("  - Top categories:")
-                    for c in top[:3]:
-                        lines.append("    * " + c["category"] + ": TTD " + str(round(c["amount"],2)))
-                invoices = idata.get("invoices",[])
-                if invoices:
-                    lines.append("  - Recent invoices:")
-                    for inv in list(reversed(invoices))[:3]:
-                        lines.append("    * " + str(inv.get("Vendor","")) + " TTD " + str(inv.get("Total",0)))
+            gc   = get_gspread_client()
+            sh   = gc.open_by_key(SHEET_ID)
+            rows = get_all_invoices(sh)
         except:
-            lines.append("Expenses: unavailable")
+            rows = []
 
-    lines.append("")
-    lines.append("---")
-
-    # Daily business lesson
-    try:
-        lesson = get_daily_lesson()
-        lines.append(lesson)
-    except Exception as e:
-        print("Lesson error: " + str(e))
-
-    lines.append("")
-    lines.append("Type /help for all commands")
-    return "\n".join(lines)
-
-def send_message(chat_id, text, parse_mode="Markdown"):
-    requests.post(
-        TELEGRAM_API + "/sendMessage",
-        json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
-    )
-
-def morning_scheduler():
-    last_sent = None
-    while True:
-        now  = datetime.datetime.utcnow()
-        date = now.date()
-        if now.hour == 12 and now.minute < 5 and OWNER_CHAT_ID and last_sent != date:
-            try:
-                print("Sending morning briefing at " + str(now))
-                # Scan emails for overnight receipts
-                try:
-                    scan_result = scan_and_log_receipts(1)  # last 24 hours only
-                    if scan_result["logged"]:
-                        vendors = ", ".join([i["vendor"] for i in scan_result["logged"][:5]])
-                        send_message(OWNER_CHAT_ID, "Auto-logged " + str(len(scan_result["logged"])) + " receipt(s) from email: " + vendors, parse_mode="")
-                except Exception as se:
-                    print("Email scan error: " + str(se))
-                briefing = get_full_briefing()
-                send_message(OWNER_CHAT_ID, briefing, parse_mode="")
-                last_sent = date
-            except Exception as e:
-                print("Morning briefing error: " + str(e))
-        time.sleep(60)
-
-@app.route("/telegram", methods=["POST"])
-def telegram_webhook():
-    update  = request.json
-    if not update:
-        return "ok"
-    msg     = update.get("message", {})
-    chat_id = msg.get("chat", {}).get("id")
-    text    = msg.get("text", "").strip()
-    text_l  = text.lower()
-    if not chat_id:
-        return "ok"
-
-    try:
-        if text_l in ("/start", "/help", "help"):
-            send_message(chat_id,
-                "*Primo Personal Assistant*\n\n"
-                "*Calendar:*\n"
-                "/today /week /schedule [event]\n\n"
-                "*Email:*\n"
-                "/emails /send [instruction]\n\n"
-                "*Business:*\n"
-                "/briefing /accounting /lesson\n\n"
-                "*Search:*\n"
-                "/search [topic] or just ask naturally\n\n"
-                "*Sheet:*\n"
-                "clear the sheet\n\n"
-                "Or just type naturally!"
-            )
-
-        elif text_l in ("/briefing", "briefing", "update", "morning", "good morning"):
-            send_message(chat_id, "Getting your briefing...", parse_mode="")
-            send_message(chat_id, get_full_briefing(), parse_mode="")
-
-        elif text_l in ("/lesson", "lesson", "business lesson", "teach me something"):
-            send_message(chat_id, get_daily_lesson(), parse_mode="")
-
-        elif text_l in ("/today", "today"):
-            events = get_todays_events()
-            if not events:
-                send_message(chat_id, "Nothing on your calendar today!")
-            else:
-                lines = ["Today - " + datetime.date.today().strftime("%A, %B %d") + "\n"]
-                for e in events:
-                    lines.append(format_event(e))
-                send_message(chat_id, "\n".join(lines), parse_mode="")
-
-        elif text_l in ("/week", "week", "this week"):
-            events = get_weeks_events()
-            if not events:
-                send_message(chat_id, "Nothing in your calendar this week!")
-            else:
-                lines = ["This Week:\n"]
-                for e in events[:10]:
-                    lines.append(format_event(e))
-                send_message(chat_id, "\n".join(lines), parse_mode="")
-
-        elif text_l.startswith("/schedule") or any(w in text_l for w in ["schedule","book","set up a meeting","add to calendar"]):
-            instruction = text.replace("/schedule","").strip() or text
-            send_message(chat_id, "Scheduling: " + instruction + "...", parse_mode="")
-            parsed = parse_event_with_claude(instruction)
-            dp     = parsed["date"].split("-")
-            tp     = parsed["start_time"].split(":")
-            start_dt = datetime.datetime(int(dp[0]),int(dp[1]),int(dp[2]),int(tp[0]),int(tp[1]))
-            end_dt   = start_dt + datetime.timedelta(hours=float(parsed.get("duration_hours",1)))
-            create_calendar_event(parsed["summary"], start_dt, end_dt, parsed.get("description",""))
-            send_message(chat_id,
-                "Event Created!\n\n" +
-                parsed["summary"] + "\n" +
-                start_dt.strftime("%A, %B %d at %I:%M %p") + "\n" +
-                "Duration: " + str(parsed.get("duration_hours",1)) + " hour(s)",
-                parse_mode=""
-            )
-
-        elif text_l in ("/emails", "emails", "check email", "unread", "inbox"):
-            send_message(chat_id, "Checking your inbox...", parse_mode="")
-            emails = get_unread_emails(5)
-            if not emails:
-                send_message(chat_id, "Inbox is clear!", parse_mode="")
-            else:
-                lines = [str(len(emails)) + " Unread Emails:\n"]
-                for i, em in enumerate(emails, 1):
-                    lines.append(str(i) + ". " + em["subject"][:50])
-                    lines.append("   From: " + em["from"][:40])
-                    lines.append("   " + em["snippet"][:80])
-                    lines.append("")
-                send_message(chat_id, "\n".join(lines), parse_mode="")
-
-        elif text_l.startswith("/send") or any(w in text_l for w in ["send email","email to","write to","draft email"]):
-            instruction = text.replace("/send","").strip() or text
-            send_message(chat_id, "Drafting: " + instruction + "...", parse_mode="")
-            draft = draft_email_with_claude(instruction)
-            send_message(chat_id,
-                "Email Draft:\n\nTo: " + draft["to"] +
-                "\nSubject: " + draft["subject"] +
-                "\n\n" + draft["body"][:300] +
-                "\n\nReply confirm to send or cancel to discard.",
-                parse_mode=""
-            )
-            app.pending_drafts = getattr(app, "pending_drafts", {})
-            app.pending_drafts[chat_id] = draft
-
-        elif text_l in ("confirm","yes send","send it") and hasattr(app,"pending_drafts") and chat_id in app.pending_drafts:
-            draft = app.pending_drafts.pop(chat_id)
-            send_email(draft["to"], draft["subject"], draft["body"])
-            send_message(chat_id, "Email sent to " + draft["to"] + "!", parse_mode="")
-
-        elif text_l in ("cancel","no","discard") and hasattr(app,"pending_drafts") and chat_id in app.pending_drafts:
-            app.pending_drafts.pop(chat_id)
-            send_message(chat_id, "Email discarded.", parse_mode="")
-
-        elif text_l in ("/accounting", "accounting", "expenses", "spending"):
-            if ACCOUNTING_API_URL:
-                r    = requests.get(ACCOUNTING_API_URL + "/api/summary", timeout=10)
-                data = r.json()
-                if data.get("status") == "ok":
-                    top  = "\n".join(["  * " + c["category"] + ": TTD " + str(round(c["amount"],2))
-                                      for c in data.get("top_categories",[])])
-                    send_message(chat_id,
-                        "Accounting Summary\n\n"
-                        "Total invoices: " + str(data.get("total_invoices",0)) + "\n"
-                        "Pending: " + str(data.get("pending_invoices",0)) + "\n"
-                        "This week: TTD " + str(round(data.get("total_spend_this_week",0),2)) + "\n"
-                        "This month: TTD " + str(round(data.get("total_spend_this_month",0),2)) + "\n"
-                        "All time: TTD " + str(round(data.get("total_spend_all_time",0),2)) + "\n\n"
-                        "Top Categories:\n" + top,
-                        parse_mode=""
-                    )
-            else:
-                send_message(chat_id, "Accounting API not configured.", parse_mode="")
-
-        elif text_l.startswith("/search") or text_l.startswith("search for") or text_l.startswith("search ") or text_l.startswith("look up") or text_l.startswith("find out"):
-            query = text.replace("/search","").replace("search for","").replace("search","").replace("look up","").replace("find out","").strip()
-            if not query:
-                send_message(chat_id, "What would you like me to search for?", parse_mode="")
-            else:
-                send_message(chat_id, "Searching for: " + query + "...", parse_mode="")
-                result = web_search(query)
-                # Use Claude to format the result nicely
-                resp = claude.messages.create(
-                    model="claude-sonnet-4-5",
-                    max_tokens=300,
-                    messages=[{"role":"user","content":
-                        "User searched: " + query + ". Results: " + result + ". Summarise in 3-5 sentences."
-                    }]
-                )
-                send_message(chat_id, resp.content[0].text, parse_mode="")
-
-        elif text_l.startswith("/search") or "search for" in text_l or "look up" in text_l:
-            query = text_l.replace("/search","").replace("search for","").replace("look up","").strip()
-            if not query:
-                send_message(chat_id, "What would you like me to search for?", parse_mode="")
-            else:
-                send_message(chat_id, "Searching...", parse_mode="")
-                result = web_search(query)
-                resp = claude.messages.create(
-                    model="claude-sonnet-4-5",
-                    max_tokens=300,
-                    messages=[{"role":"user","content":
-                        "User searched: " + query + ". Results: " + result +
-                        ". Summarise clearly in 3-5 sentences."
-                    }]
-                )
-                send_message(chat_id, resp.content[0].text, parse_mode="")
-
-        elif any(p in text_l for p in ["scan emails","check emails for receipts","scan for receipts",
-                                        "find receipts","check for invoices","/scanemails"]):
-            days = 10
-            for word in text_l.split():
-                if word.isdigit():
-                    days = int(word)
-                    break
-            send_message(chat_id, "Scanning your emails for receipts from the last " + str(days) + " days... I will message you when done.", parse_mode="")
-            def do_scan(chat_id=chat_id, days=days):
-                try:
-                    result = scan_and_log_receipts(days)
-                    logged = result["logged"]
-                    if not logged:
-                        send_message(chat_id, "No receipts found in the last " + str(days) + " days. " + str(result["total_scanned"]) + " emails scanned.", parse_mode="")
-                    else:
-                        lines = ["Found and logged " + str(len(logged)) + " receipt(s):"]
-                        for item in logged:
-                            lines.append(item["inv_id"] + " | " + item["vendor"] + " | TTD " + str(item["total"]))
-                        lines.append("All added to your Google Sheet!")
-                        send_message(chat_id, " | ".join(lines), parse_mode="")
-                except Exception as e:
-                    send_message(chat_id, "Error scanning emails: " + str(e)[:100], parse_mode="")
-            threading.Thread(target=do_scan, daemon=True).start()
-
-        elif any(p in text_l for p in ["clear the sheet","clear sheet","delete all invoices",
-                                        "delete all entries","start fresh","start over",
-                                        "wipe the sheet","reset the sheet","clear all data"]):
-            send_message(chat_id, "Clearing all invoice data now...", parse_mode="")
-            try:
-                r    = requests.post(ACCOUNTING_API_URL + "/api/clearsheet", timeout=15)
-                data = r.json()
-                if data.get("status") == "ok":
-                    send_message(chat_id, "All sheets cleared! Ready for a fresh start. Next invoice will be INV-001.", parse_mode="")
-                else:
-                    send_message(chat_id, "Error: " + data.get("message","unknown"), parse_mode="")
-            except Exception as e:
-                send_message(chat_id, "Error: " + str(e)[:100], parse_mode="")
-
+        if "summary" in body_text or "report" in body_text:
+            resp.message(build_summary_text(rows, "All Time"))
+        elif "week" in body_text:
+            resp.message(build_summary_text(get_weekly_rows(rows), "This Week"))
+        elif "month" in body_text:
+            resp.message(build_summary_text(get_monthly_rows(rows), "This Month"))
+        elif "categor" in body_text:
+            cat_totals = {}
+            for r in rows:
+                cat = r.get("Category","Other") or "Other"
+                cat_totals[cat] = cat_totals.get(cat,0) + float(r.get("Amount",0) or 0)
+            lines = ["📂 *Spend by Category (All Time)*\n"]
+            for cat, amt in sorted(cat_totals.items(), key=lambda x: -x[1]):
+                lines.append(f"• {cat}: ${amt:,.2f}")
+            resp.message("\n".join(lines))
         else:
-            # Natural language — fetch accounting data for context
-            acct_ctx  = get_accounting_context()
-            email_ctx = ""
-            try:
-                svc = get_gmail_service()
-                q   = "in:inbox newer_than:7d"
-                for word in text.split():
-                    w = word.strip("?.,!").lower()
-                    if len(w) > 3 and w not in {"from","have","what","that","this","your","with","email","inbox","mail","about","were","there","emails","messages","yesterday","today","week"}:
-                        q = "in:inbox newer_than:7d " + word.strip("?.,!")
-                        break
-                res  = svc.users().messages().list(userId="me", q=q, maxResults=5).execute()
-                msgs = res.get("messages",[])
-                if msgs:
-                    lines = []
-                    for m in msgs[:5]:
-                        d = svc.users().messages().get(userId="me",id=m["id"],format="metadata",metadataHeaders=["From","Subject","Date"]).execute()
-                        h = {x["name"]:x["value"] for x in d["payload"]["headers"]}
-                        lines.append("From:"+h.get("From","")[:35].replace(chr(34),"")+
-                                     " Subj:"+h.get("Subject","")[:45].replace(chr(34),"")+
-                                     " "+h.get("Date","")[:16]+
-                                     " Preview:"+d.get("snippet","")[:70].replace(chr(34),""))
-                    email_ctx = " Recent emails: " + " | ".join(lines)
-                else:
-                    email_ctx = " No recent emails found."
-            except Exception as e:
-                email_ctx = " Email unavailable: " + str(e)[:50]
-            system_prompt = (
-                "You are Primo, George Solomon's sharp and intelligent personal business assistant in Trinidad. "
-                "George owns a restaurant. You have full access to his Gmail (georgejgsolomon@gmail.com), "
-                "Google Calendar, and accounting data. "
-                "You remember the full conversation history — use it to understand context. "
-                "When asked about someone or something, search the email data provided. "
-                "Use TTD for currency. Be conversational, direct and smart. "
-                "Never say you lack access to data."
+            resp.message(
+                "👋 *Accounting Agent*\n\n"
+                "📸 Send a photo of any bill to log it\n\n"
+                "*Commands:*\n"
+                "• *summary* — all time totals\n"
+                "• *week* — this week\n"
+                "• *month* — this month\n"
+                "• *categories* — spend by category"
             )
-            history  = get_history(chat_id)
-            full_msg = text + acct_ctx + email_ctx
-            response = claude.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=600,
-                system=system_prompt,
-                messages=history + [{"role":"user","content": full_msg}]
-            )
-            reply = response.content[0].text
-            add_to_history(chat_id, "user", text)
-            add_to_history(chat_id, "assistant", reply)
-            send_message(chat_id, reply, parse_mode="")
+        return str(resp)
 
+    try:
+        media_url = request.form.get("MediaUrl0")
+        image_b64, media_type = fetch_image_b64(media_url)
+        data   = extract_invoice(image_b64, media_type)
+        inv_id = append_to_sheet(data, msg_sid)
+
+        conf_emoji = {"high":"✅","medium":"⚠️","low":"🔴"}.get(data.get("confidence","?"),"❓")
+        amount = float(data.get("amount",0))
+        tax    = float(data.get("tax",0))
+
+        resp.message(
+            f"✅ *Invoice Logged!*\n\n"
+            f"🆔 ID: `{inv_id}`\n"
+            f"🏢 Vendor: {data.get('vendor','Unknown')}\n"
+            f"📅 Date: {data.get('invoice_date','N/A')}\n"
+            f"🔢 Invoice #: {data.get('invoice_number','N/A')}\n"
+            f"📦 Category: {data.get('category','Other')}\n"
+            f"💵 Amount: {data.get('currency','USD')} {amount:,.2f}\n"
+            f"🧾 Tax: {data.get('currency','USD')} {tax:,.2f}\n"
+            f"💰 Total: {data.get('currency','USD')} {amount+tax:,.2f}\n\n"
+            f"{conf_emoji} Confidence: {data.get('confidence','?')}\n"
+            f"📊 Google Sheet updated!"
+        )
+
+    except json.JSONDecodeError:
+        resp.message("⚠️ Could read image but had trouble parsing details. Try a clearer photo.")
     except Exception as e:
         traceback.print_exc()
-        send_message(chat_id, "Error: " + str(e)[:100] + "\n\nTry /help", parse_mode="")
+        resp.message(f"❌ Something went wrong. Error: {str(e)[:80]}")
 
-    return "ok"
+    return str(resp)
+
+@app.route("/send-report", methods=["GET"])
+def manual_report():
+    try:
+        gc   = get_gspread_client()
+        sh   = gc.open_by_key(SHEET_ID)
+        rows = get_all_invoices(sh)
+        send_weekly_email(rows)
+        return {"status": "Report sent!", "to": REPORT_EMAIL}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @app.route("/", methods=["GET"])
 def health():
-    return {"status":"ok","bot":"PrimoAssistanttBot","time":str(datetime.datetime.now())}
+    return {"status":"ok","agent":"Accounting Agent v2","time":str(datetime.datetime.now())}
 
-threading.Thread(target=morning_scheduler, daemon=True).start()
+scheduler_thread = threading.Thread(target=weekly_scheduler, daemon=True)
+scheduler_thread.start()
 
 if __name__ == "__main__":
-    print("PrimoAssistanttBot starting on http://localhost:5002")
-    app.run(host="0.0.0.0", port=5002, debug=False)
+    print("Accounting Agent v2 starting on http://localhost:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False)
