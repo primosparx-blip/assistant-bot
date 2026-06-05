@@ -743,10 +743,11 @@ def telegram_webhook():
                 model="claude-sonnet-4-5",
                 max_tokens=400,
                 messages=[{"role":"user","content":
-                    "You are George's personal business assistant in Trinidad. "
+                    "You are Primo, George Solomon's personal business assistant in Trinidad. "
+                    "George owns a restaurant. You have full access to his Gmail and accounting data. "
                     "The user said: " + text +
-                    acct_ctx +
-                    "\n\nAnswer directly using the data. Use TTD for currency. "
+                    acct_ctx + email_ctx +
+                    " Answer directly using ALL data provided above. Use TTD for currency. "
                     "Do partial vendor name matching. Never say you don't have access to data. "
                     "Be concise."
                 }]
