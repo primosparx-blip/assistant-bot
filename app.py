@@ -754,20 +754,27 @@ def telegram_webhook():
                     email_ctx = " No recent emails found."
             except Exception as e:
                 email_ctx = " Email unavailable: " + str(e)[:50]
+            system_prompt = (
+                "You are Primo, George Solomon's sharp and intelligent personal business assistant in Trinidad. "
+                "George owns a restaurant. You have full access to his Gmail (georgejgsolomon@gmail.com), "
+                "Google Calendar, and accounting data. "
+                "You remember the full conversation history — use it to understand context. "
+                "When asked about someone or something, search the email data provided. "
+                "Use TTD for currency. Be conversational, direct and smart. "
+                "Never say you lack access to data."
+            )
+            history  = get_history(chat_id)
+            full_msg = text + acct_ctx + email_ctx
             response = claude.messages.create(
                 model="claude-sonnet-4-5",
-                max_tokens=400,
-                messages=[{"role":"user","content":
-                    "You are Primo, George Solomon's personal business assistant in Trinidad. "
-                    "George owns a restaurant. You have full access to his Gmail and accounting data. "
-                    "The user said: " + text +
-                    acct_ctx + email_ctx +
-                    " Answer directly using ALL data provided above. Use TTD for currency. "
-                    "Do partial vendor name matching. Never say you don't have access to data. "
-                    "Be concise."
-                }]
+                max_tokens=600,
+                system=system_prompt,
+                messages=history + [{"role":"user","content": full_msg}]
             )
-            send_message(chat_id, response.content[0].text, parse_mode="")
+            reply = response.content[0].text
+            add_to_history(chat_id, "user", text)
+            add_to_history(chat_id, "assistant", reply)
+            send_message(chat_id, reply, parse_mode="")
 
     except Exception as e:
         traceback.print_exc()
