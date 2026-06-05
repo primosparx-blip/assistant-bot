@@ -12,6 +12,21 @@ from email.mime.text import MIMEText
 
 app = Flask(__name__)
 
+# In-memory conversation history per user (last 10 messages)
+conversation_history = {}
+
+def get_history(chat_id):
+    return conversation_history.get(str(chat_id), [])
+
+def add_to_history(chat_id, role, content):
+    key = str(chat_id)
+    if key not in conversation_history:
+        conversation_history[key] = []
+    conversation_history[key].append({"role": role, "content": content})
+    # Keep only last 10 exchanges (20 messages)
+    if len(conversation_history[key]) > 20:
+        conversation_history[key] = conversation_history[key][-20:]
+
 TELEGRAM_TOKEN     = os.environ["ASSISTANT_BOT_TOKEN"]
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 GOOGLE_TOKEN_JSON  = os.environ.get("GOOGLE_TOKEN_JSON", "")
