@@ -713,7 +713,32 @@ def telegram_webhook():
 
         else:
             # Natural language — fetch accounting data for context
-            acct_ctx = get_accounting_context()
+            acct_ctx  = get_accounting_context()
+            email_ctx = ""
+            try:
+                svc = get_gmail_service()
+                q   = "in:inbox newer_than:7d"
+                for word in text.split():
+                    w = word.strip("?.,!").lower()
+                    if len(w) > 3 and w not in {"from","have","what","that","this","your","with","email","inbox","mail","about","were","there","emails","messages","yesterday","today","week"}:
+                        q = "in:inbox newer_than:7d " + word.strip("?.,!")
+                        break
+                res  = svc.users().messages().list(userId="me", q=q, maxResults=5).execute()
+                msgs = res.get("messages",[])
+                if msgs:
+                    lines = []
+                    for m in msgs[:5]:
+                        d = svc.users().messages().get(userId="me",id=m["id"],format="metadata",metadataHeaders=["From","Subject","Date"]).execute()
+                        h = {x["name"]:x["value"] for x in d["payload"]["headers"]}
+                        lines.append("From:"+h.get("From","")[:35].replace(chr(34),"")+
+                                     " Subj:"+h.get("Subject","")[:45].replace(chr(34),"")+
+                                     " "+h.get("Date","")[:16]+
+                                     " Preview:"+d.get("snippet","")[:70].replace(chr(34),""))
+                    email_ctx = " Recent emails: " + " | ".join(lines)
+                else:
+                    email_ctx = " No recent emails found."
+            except Exception as e:
+                email_ctx = " Email unavailable: " + str(e)[:50]
             response = claude.messages.create(
                 model="claude-sonnet-4-5",
                 max_tokens=400,
