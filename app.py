@@ -322,24 +322,41 @@ def build_context(text):
 
     # Fetch emails — always, for any question
     try:
-        # Build smart query
+        # Build smart query — check current message AND conversation history
         q = "in:inbox newer_than:7d"
         skip = {"what","is","my","the","from","have","any","did","get","for","that","this",
                 "your","can","you","see","email","inbox","mail","about","were","there",
-                "emails","messages","yesterday","today","week","any","are","there","was"}
+                "emails","messages","yesterday","today","week","please","most","recent",
+                "latest","only","just","okay","yes","no","sure","want","need","have","got"}
+
+        search_term = ""
+        # Try current message first
         for word in text.split():
             w = word.strip("?.,!").lower()
             if len(w) > 3 and w not in skip:
-                q = "in:inbox newer_than:14d " + word.strip("?.,!")
+                search_term = word.strip("?.,!")
                 break
-        if "yesterday" in text_l:
+
+        # If message is vague (follow-up like "most recent please"), use history
+        if not search_term or len(text.strip("?! ")) < 20:
+            hist = get_history(chat_id)
+            for msg in reversed(hist[-8:]):
+                for word in msg.get("content","").split():
+                    w = word.strip("?.,!").lower()
+                    if len(w) > 3 and w not in skip:
+                        search_term = word.strip("?.,!")
+                        break
+                if search_term:
+                    break
+
+        if "yesterday" in text.lower():
             q = "in:inbox newer_than:2d older_than:1d"
-        elif "today" in text_l:
+        elif "today" in text.lower():
             q = "in:inbox newer_than:1d"
-        elif "last week" in text_l or "this week" in text_l:
-            q = "in:inbox newer_than:7d"
-        elif "jmmb" in text_l or "transaction" in text_l:
+        elif "jmmb" in text.lower() or "transaction" in text.lower():
             q = "from:transactionalerts@jmmb.com newer_than:7d"
+        elif search_term:
+            q = "in:inbox newer_than:14d " + search_term
 
         emails = search_emails(q, max_results=8)
         if emails:
