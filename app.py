@@ -1,38 +1,28 @@
 """
-Primo — Personal Business Assistant
-====================================
-A fully featured Telegram bot for George Solomon, Trinidad.
-Features:
-- Conversation memory (per session)
-- Gmail: read, search, find attachments, send files to Telegram
-- Google Calendar: read events, create events, reminders
-- Accounting: query all agent bots via API
-- Daily 8am briefing with business lesson
-- Auto email receipt scanning every 24hrs
-- Proactive event reminders
-- Meal and activity suggestions
-- Natural language understanding via Claude
+Primo v2 — Tool-Use Personal Assistant
+========================================
+Claude is in control. Claude decides when to search emails,
+check calendar, query accounting, search the web, etc.
+No keyword matching. Pure conversational AI.
 """
 
-import os, json, base64, datetime, hashlib, requests, traceback, threading, time, io
+import os, json, base64, datetime, hashlib, requests, traceback, threading, time, io, re
 from flask import Flask, request
 import anthropic
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 app = Flask(__name__)
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN     = os.environ["ASSISTANT_BOT_TOKEN"]
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 GOOGLE_TOKEN_JSON  = os.environ.get("GOOGLE_TOKEN_JSON", "")
 ACCOUNTING_API_URL = os.environ.get("ACCOUNTING_API_URL", "")
 OWNER_CHAT_ID      = os.environ.get("OWNER_CHAT_ID", "")
 OWNER_NAME         = os.environ.get("OWNER_NAME", "George")
-OWNER_EMAIL        = os.environ.get("OWNER_EMAIL", "georgejgsolomon@gmail.com")
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -49,29 +39,30 @@ Your personality: Sharp, warm, proactive, direct. You speak like a trusted advis
 
 What you know about George:
 - Owns a restaurant business in Trinidad
-- Banks with JMMB (gets transaction alerts from transactionalerts@jmmb.com)
+- Banks with JMMB (transaction alerts from transactionalerts@jmmb.com)
 - Uses TT RideShare for transport
 - Regular suppliers: Hadco, Trinidad Seafoods, A.S. Bryden, MoreVino/MoreSushi
 - Gmail: georgejgsolomon@gmail.com
-- Uses TTD (Trinidad dollar) as primary currency
+- Primary currency: TTD (Trinidad dollars)
 
-Your capabilities:
-- Read and search Gmail
-- Find and send email attachments to Telegram
-- Read and create Google Calendar events
-- Query accounting data (invoices, expenses, categories)
-- Search the web for current information
-- Remember the full conversation history
+You have tools available. Use them proactively:
+- When George asks about emails, people, or messages → use search_emails
+- When George asks about his schedule, meetings, events → use get_calendar_events
+- When George asks about expenses, invoices, spending → use get_accounting_data
+- When George asks about files or attachments → use get_email_attachments
+- When George needs something looked up online → use web_search
+- When George wants to schedule something → use create_calendar_event
+- When George wants to send an email → use send_email
 
-Rules:
-- NEVER say you don't have access to data — you do, use it
-- Always be specific with names, amounts, dates
-- Flag anything unusual or worth noting proactively
-- Use TTD for local currency, note when amounts are USD
-- Keep responses conversational, not bullet-pointed unless it helps
-- If you need to do something, say what you're doing"""
+IMPORTANT RULES:
+- Always use tools to get real data before answering questions about emails/calendar/expenses
+- Never say you don't have access — you have tools, use them
+- Never ask George to rephrase in a specific way — understand his intent
+- Be conversational and natural, like a real assistant
+- Use TTD for local currency
+- Remember the conversation history and maintain context"""
 
-# ── Conversation Memory ──────────────────────────────────────────────────────
+# ── Conversation Memory ───────────────────────────────────────────────────────
 conversation_history = {}
 
 def get_history(chat_id):
@@ -81,14 +72,17 @@ def add_to_history(chat_id, role, content):
     key = str(chat_id)
     if key not in conversation_history:
         conversation_history[key] = []
-    conversation_history[key].append({"role": role, "content": content[:2000]})
+    if isinstance(content, list):
+        conversation_history[key].append({"role": role, "content": content})
+    else:
+        conversation_history[key].append({"role": role, "content": str(content)[:3000]})
     if len(conversation_history[key]) > 20:
         conversation_history[key] = conversation_history[key][-20:]
 
 def clear_history(chat_id):
     conversation_history[str(chat_id)] = []
 
-# ── Google Auth ──────────────────────────────────────────────────────────────
+# ── Google Auth ───────────────────────────────────────────────────────────────
 def get_google_creds():
     if GOOGLE_TOKEN_JSON:
         token_data = json.loads(GOOGLE_TOKEN_JSON)
@@ -100,167 +94,198 @@ def get_google_creds():
         if not creds.valid or creds.expired:
             creds.refresh(Request())
     except Exception:
-        creds.refresh(Request())
+        try:
+            creds.refresh(Request())
+        except:
+            pass
     return creds
 
 def get_gmail():
     return build("gmail", "v1", credentials=get_google_creds())
 
-def get_calendar():
+def get_calendar_svc():
     return build("calendar", "v3", credentials=get_google_creds())
 
-# ── Gmail Functions ──────────────────────────────────────────────────────────
-def search_emails(query, max_results=10):
-    svc  = get_gmail()
-    res  = svc.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
-    msgs = res.get("messages", [])
-    results = []
-    for m in msgs:
-        d = svc.users().messages().get(
-            userId="me", id=m["id"], format="metadata",
-            metadataHeaders=["From","Subject","Date"]
-        ).execute()
-        h = {x["name"]:x["value"] for x in d["payload"]["headers"]}
-        results.append({
-            "id":      m["id"],
-            "from":    h.get("From",""),
-            "subject": h.get("Subject",""),
-            "date":    h.get("Date",""),
-            "snippet": d.get("snippet","")[:150]
-        })
-    return results
+# ── Tool Implementations ──────────────────────────────────────────────────────
 
-def get_email_body_and_attachments(msg_id):
-    svc     = get_gmail()
-    detail  = svc.users().messages().get(userId="me", id=msg_id, format="full").execute()
-    payload = detail.get("payload", {})
-
-    def extract_text(part):
-        # Try plain text first
-        if part.get("mimeType") == "text/plain":
-            data = part.get("body", {}).get("data", "")
-            if data:
-                return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-        # Fall back to HTML and strip tags
-        if part.get("mimeType") == "text/html":
-            data = part.get("body", {}).get("data", "")
-            if data:
-                html = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-                import re
-                text = re.sub(r"<[^>]+>", " ", html)
-                text = re.sub(r"\s+", " ", text).strip()
-                return text[:3000]
-        for sub in part.get("parts", []):
-            result = extract_text(sub)
-            if result:
-                return result
-        return ""
-
-    def extract_attachments(part, atts=None):
-        if atts is None:
-            atts = []
-        if part.get("filename"):
-            atts.append({
-                "filename":      part["filename"],
-                "mimeType":      part.get("mimeType",""),
-                "attachment_id": part.get("body",{}).get("attachmentId",""),
-                "size":          part.get("body",{}).get("size",0)
+def tool_search_emails(query, max_results=8):
+    """Search Gmail and return email summaries."""
+    try:
+        svc  = get_gmail()
+        res  = svc.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
+        msgs = res.get("messages", [])
+        if not msgs:
+            return {"emails": [], "count": 0, "message": "No emails found for: " + query}
+        results = []
+        for m in msgs:
+            d = svc.users().messages().get(
+                userId="me", id=m["id"], format="metadata",
+                metadataHeaders=["From","Subject","Date"]
+            ).execute()
+            h = {x["name"]:x["value"] for x in d["payload"]["headers"]}
+            results.append({
+                "id":      m["id"],
+                "from":    h.get("From",""),
+                "subject": h.get("Subject",""),
+                "date":    h.get("Date",""),
+                "snippet": d.get("snippet","")[:200]
             })
-        for sub in part.get("parts", []):
-            extract_attachments(sub, atts)
-        return atts
+        return {"emails": results, "count": len(results)}
+    except Exception as e:
+        return {"error": str(e)}
 
-    body        = extract_text(payload)[:3000]
-    attachments = extract_attachments(payload)
-    return body, attachments
-
-def download_and_send_attachment(chat_id, msg_id, attachment_id, filename, caption=""):
-    svc = get_gmail()
-    att = svc.users().messages().attachments().get(
-        userId="me", messageId=msg_id, id=attachment_id
-    ).execute()
-    file_data  = att.get("data","")
-    file_bytes = base64.urlsafe_b64decode(file_data + "==")
-    files = {"document": (filename, io.BytesIO(file_bytes))}
-    data  = {"chat_id": chat_id, "caption": caption[:200]}
-    r = requests.post(TELEGRAM_API + "/sendDocument", data=data, files=files, timeout=30)
-    return r.json().get("ok", False)
-
-def send_gmail(to, subject, body):
-    svc     = get_gmail()
-    message = MIMEText(body)
-    message["to"]      = to
-    message["subject"] = subject
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-    svc.users().messages().send(userId="me", body={"raw": raw}).execute()
-
-# ── Calendar Functions ───────────────────────────────────────────────────────
-def get_events(days_ahead=1, days_back=0):
-    svc   = get_calendar()
-    now   = datetime.datetime.utcnow()
-    start = (now - datetime.timedelta(days=days_back)).isoformat() + "Z"
-    end   = (now + datetime.timedelta(days=days_ahead)).isoformat() + "Z"
-    res   = svc.events().list(
-        calendarId="primary", timeMin=start, timeMax=end,
-        singleEvents=True, orderBy="startTime", maxResults=20
-    ).execute()
-    return res.get("items", [])
-
-def format_event(event):
-    start    = event.get("start", {})
-    time_str = start.get("dateTime","") or start.get("date","")
+def tool_read_email(email_id):
+    """Read the full content of a specific email including attachments."""
     try:
-        dt       = datetime.datetime.fromisoformat(time_str.replace("Z",""))
-        dt_local = dt - datetime.timedelta(hours=4)
-        time_str = dt_local.strftime("%a %b %d, %I:%M %p")
-    except:
-        pass
-    return event.get("summary","No title") + " — " + time_str
+        svc    = get_gmail()
+        detail = svc.users().messages().get(userId="me", id=email_id, format="full").execute()
+        payload = detail.get("payload", {})
 
-def create_event(summary, start_dt, end_dt, description=""):
-    svc   = get_calendar()
-    event = {
-        "summary":     summary,
-        "description": description,
-        "start": {"dateTime": start_dt.isoformat(), "timeZone": "America/Port_of_Spain"},
-        "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "America/Port_of_Spain"},
-    }
-    return svc.events().insert(calendarId="primary", body=event).execute()
+        def extract_text(part):
+            if part.get("mimeType") == "text/plain":
+                data = part.get("body", {}).get("data", "")
+                if data:
+                    return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+            if part.get("mimeType") == "text/html":
+                data = part.get("body", {}).get("data", "")
+                if data:
+                    html = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                    text = re.sub(r"<[^>]+>", " ", html)
+                    return re.sub(r"\s+", " ", text).strip()
+            for sub in part.get("parts", []):
+                result = extract_text(sub)
+                if result:
+                    return result
+            return ""
 
-# ── Accounting Bot API ───────────────────────────────────────────────────────
-def get_accounting_summary():
+        def get_attachments(part, atts=None):
+            if atts is None:
+                atts = []
+            if part.get("filename"):
+                atts.append({
+                    "filename":      part["filename"],
+                    "mimeType":      part.get("mimeType",""),
+                    "attachment_id": part.get("body",{}).get("attachmentId",""),
+                    "size":          part.get("body",{}).get("size",0)
+                })
+            for sub in part.get("parts", []):
+                get_attachments(sub, atts)
+            return atts
+
+        h = {x["name"]:x["value"] for x in payload.get("headers",[])}
+        body        = extract_text(payload)
+        attachments = get_attachments(payload)
+
+        return {
+            "from":        h.get("From",""),
+            "subject":     h.get("Subject",""),
+            "date":        h.get("Date",""),
+            "body":        body[:3000] if body else "(no text body — may be attachment only)",
+            "attachments": attachments
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+def tool_send_attachment_to_telegram(chat_id, email_id, attachment_id, filename):
+    """Download email attachment and send to Telegram."""
+    try:
+        svc        = get_gmail()
+        att        = svc.users().messages().attachments().get(
+            userId="me", messageId=email_id, id=attachment_id
+        ).execute()
+        file_data  = att.get("data","")
+        file_bytes = base64.urlsafe_b64decode(file_data + "==")
+        files      = {"document": (filename, io.BytesIO(file_bytes))}
+        data       = {"chat_id": chat_id}
+        r          = requests.post(TELEGRAM_API + "/sendDocument", data=data, files=files, timeout=30)
+        result     = r.json()
+        if result.get("ok"):
+            return {"success": True, "message": "Sent " + filename + " to Telegram"}
+        return {"success": False, "error": str(result)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def tool_get_calendar_events(days_ahead=7, days_back=0):
+    """Get calendar events."""
+    try:
+        svc   = get_calendar_svc()
+        now   = datetime.datetime.utcnow()
+        start = (now - datetime.timedelta(days=days_back)).isoformat() + "Z"
+        end   = (now + datetime.timedelta(days=days_ahead)).isoformat() + "Z"
+        res   = svc.events().list(
+            calendarId="primary", timeMin=start, timeMax=end,
+            singleEvents=True, orderBy="startTime", maxResults=20
+        ).execute()
+        events = []
+        for e in res.get("items", []):
+            start_dt = e.get("start",{}).get("dateTime","") or e.get("start",{}).get("date","")
+            try:
+                dt       = datetime.datetime.fromisoformat(start_dt.replace("Z",""))
+                dt_local = dt - datetime.timedelta(hours=4)
+                time_str = dt_local.strftime("%A, %B %d at %I:%M %p")
+            except:
+                time_str = start_dt
+            events.append({
+                "title":    e.get("summary","No title"),
+                "time":     time_str,
+                "location": e.get("location",""),
+                "description": e.get("description","")
+            })
+        return {"events": events, "count": len(events)}
+    except Exception as e:
+        return {"error": str(e)}
+
+def tool_create_calendar_event(title, date, start_time, duration_hours=1, description=""):
+    """Create a calendar event."""
+    try:
+        svc = get_calendar_svc()
+        parts = date.split("-")
+        tparts = start_time.split(":")
+        start_dt = datetime.datetime(int(parts[0]),int(parts[1]),int(parts[2]),
+                                     int(tparts[0]),int(tparts[1]))
+        end_dt   = start_dt + datetime.timedelta(hours=float(duration_hours))
+        event    = {
+            "summary":     title,
+            "description": description,
+            "start": {"dateTime": start_dt.isoformat(), "timeZone": "America/Port_of_Spain"},
+            "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "America/Port_of_Spain"},
+        }
+        result = svc.events().insert(calendarId="primary", body=event).execute()
+        return {"success": True, "event": title, "time": start_dt.strftime("%A, %B %d at %I:%M %p")}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def tool_send_email(to, subject, body):
+    """Send an email."""
+    try:
+        svc     = get_gmail()
+        message = MIMEText(body)
+        message["to"]      = to
+        message["subject"] = subject
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        svc.users().messages().send(userId="me", body={"raw": raw}).execute()
+        return {"success": True, "message": "Email sent to " + to}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def tool_get_accounting_data():
+    """Get accounting summary and recent invoices."""
     if not ACCOUNTING_API_URL:
-        return {}
+        return {"error": "Accounting API not configured"}
     try:
-        r = requests.get(ACCOUNTING_API_URL + "/api/summary", timeout=10)
-        return r.json()
-    except:
-        return {}
+        sum_r  = requests.get(ACCOUNTING_API_URL + "/api/summary", timeout=10)
+        inv_r  = requests.get(ACCOUNTING_API_URL + "/api/invoices?limit=20", timeout=10)
+        sdata  = sum_r.json()
+        idata  = inv_r.json()
+        return {
+            "summary":  sdata,
+            "invoices": idata.get("invoices", [])
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
-def get_all_invoices(limit=50):
-    if not ACCOUNTING_API_URL:
-        return []
-    try:
-        r = requests.get(ACCOUNTING_API_URL + "/api/invoices?limit=" + str(limit), timeout=10)
-        return r.json().get("invoices", [])
-    except:
-        return []
-
-def log_invoice_to_sheet(data, source="email_scan"):
-    if not ACCOUNTING_API_URL:
-        return None
-    try:
-        r = requests.post(
-            ACCOUNTING_API_URL + "/api/log_invoice",
-            json={"data": data, "source": source},
-            timeout=15
-        )
-        return r.json().get("inv_id")
-    except:
-        return None
-
-# ── Web Search ───────────────────────────────────────────────────────────────
-def web_search(query):
+def tool_web_search(query):
+    """Search the web for current information."""
     try:
         r = requests.get(
             "https://api.duckduckgo.com/",
@@ -274,11 +299,230 @@ def web_search(query):
         for topic in data.get("RelatedTopics", [])[:3]:
             if isinstance(topic, dict) and topic.get("Text"):
                 results.append(topic["Text"])
-        return " | ".join(results[:3]) if results else "No results found for: " + query
+        return {"results": " | ".join(results[:3]) if results else "No results found"}
     except Exception as e:
-        return "Search error: " + str(e)
+        return {"error": str(e)}
 
-# ── Daily Business Lesson ────────────────────────────────────────────────────
+def tool_clear_accounting_sheet():
+    """Clear all invoice data from the accounting sheet."""
+    if not ACCOUNTING_API_URL:
+        return {"error": "Accounting API not configured"}
+    try:
+        r = requests.post(ACCOUNTING_API_URL + "/api/clearsheet", timeout=15)
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+# ── Tool Definitions for Claude ───────────────────────────────────────────────
+TOOLS = [
+    {
+        "name": "search_emails",
+        "description": "Search Gmail inbox. Use this whenever George asks about emails, messages, or specific people. Build a good Gmail search query (e.g. 'from:sean', 'subject:invoice', 'newer_than:7d', 'from:jmmb').",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query":       {"type": "string", "description": "Gmail search query e.g. 'from:sean newer_than:7d' or 'subject:invoice newer_than:14d'"},
+                "max_results": {"type": "integer", "description": "Max emails to return (default 8)", "default": 8}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "read_email",
+        "description": "Read the full content and attachments of a specific email. Use after search_emails to get the full body of an email.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "email_id": {"type": "string", "description": "The email ID from search_emails results"}
+            },
+            "required": ["email_id"]
+        }
+    },
+    {
+        "name": "send_attachment_to_telegram",
+        "description": "Download an email attachment and send it to George via Telegram. Use when George wants a file from his email.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "email_id":      {"type": "string", "description": "Email ID containing the attachment"},
+                "attachment_id": {"type": "string", "description": "Attachment ID from read_email results"},
+                "filename":      {"type": "string", "description": "Filename of the attachment"}
+            },
+            "required": ["email_id", "attachment_id", "filename"]
+        }
+    },
+    {
+        "name": "get_calendar_events",
+        "description": "Get George's calendar events. Use when he asks about his schedule, meetings, appointments, or upcoming events.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days_ahead": {"type": "integer", "description": "How many days ahead to look (default 7)", "default": 7},
+                "days_back":  {"type": "integer", "description": "How many days back to look (default 0)", "default": 0}
+            }
+        }
+    },
+    {
+        "name": "create_calendar_event",
+        "description": "Create a new calendar event for George.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title":          {"type": "string",  "description": "Event title"},
+                "date":           {"type": "string",  "description": "Date in YYYY-MM-DD format"},
+                "start_time":     {"type": "string",  "description": "Start time in HH:MM 24hr format"},
+                "duration_hours": {"type": "number",  "description": "Duration in hours (default 1)", "default": 1},
+                "description":    {"type": "string",  "description": "Optional description", "default": ""}
+            },
+            "required": ["title", "date", "start_time"]
+        }
+    },
+    {
+        "name": "send_email",
+        "description": "Send an email on George's behalf.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to":      {"type": "string", "description": "Recipient email address"},
+                "subject": {"type": "string", "description": "Email subject"},
+                "body":    {"type": "string", "description": "Email body text"}
+            },
+            "required": ["to", "subject", "body"]
+        }
+    },
+    {
+        "name": "get_accounting_data",
+        "description": "Get George's accounting data including invoice summary and recent invoices. Use when he asks about expenses, spending, invoices, or financial data.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "web_search",
+        "description": "Search the web for current information, news, prices, or anything that requires up-to-date data.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "clear_accounting_sheet",
+        "description": "Clear all invoice data from the accounting spreadsheet. Only use when George explicitly asks to clear or reset the sheet.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    }
+]
+
+# ── Tool Executor ─────────────────────────────────────────────────────────────
+def execute_tool(tool_name, tool_input, chat_id):
+    """Execute a tool and return the result."""
+    print(f"Executing tool: {tool_name} with input: {json.dumps(tool_input)[:200]}")
+    if tool_name == "search_emails":
+        return tool_search_emails(
+            tool_input.get("query","in:inbox newer_than:7d"),
+            tool_input.get("max_results", 8)
+        )
+    elif tool_name == "read_email":
+        return tool_read_email(tool_input.get("email_id",""))
+    elif tool_name == "send_attachment_to_telegram":
+        return tool_send_attachment_to_telegram(
+            chat_id,
+            tool_input.get("email_id",""),
+            tool_input.get("attachment_id",""),
+            tool_input.get("filename","file")
+        )
+    elif tool_name == "get_calendar_events":
+        return tool_get_calendar_events(
+            tool_input.get("days_ahead", 7),
+            tool_input.get("days_back", 0)
+        )
+    elif tool_name == "create_calendar_event":
+        return tool_create_calendar_event(
+            tool_input.get("title",""),
+            tool_input.get("date",""),
+            tool_input.get("start_time","09:00"),
+            tool_input.get("duration_hours", 1),
+            tool_input.get("description","")
+        )
+    elif tool_name == "send_email":
+        return tool_send_email(
+            tool_input.get("to",""),
+            tool_input.get("subject",""),
+            tool_input.get("body","")
+        )
+    elif tool_name == "get_accounting_data":
+        return tool_get_accounting_data()
+    elif tool_name == "web_search":
+        return tool_web_search(tool_input.get("query",""))
+    elif tool_name == "clear_accounting_sheet":
+        return tool_clear_accounting_sheet()
+    else:
+        return {"error": f"Unknown tool: {tool_name}"}
+
+# ── Agentic Loop ──────────────────────────────────────────────────────────────
+def run_agent(chat_id, user_message):
+    """
+    Run the Claude agent loop.
+    Claude can call multiple tools in sequence until it has all the info it needs.
+    """
+    history  = get_history(chat_id)
+    messages = history + [{"role": "user", "content": user_message}]
+
+    max_iterations = 8
+    iterations     = 0
+
+    while iterations < max_iterations:
+        iterations += 1
+
+        response = claude.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages
+        )
+
+        # Check stop reason
+        if response.stop_reason == "end_turn":
+            # Claude is done — extract final text response
+            final_text = ""
+            for block in response.content:
+                if hasattr(block, "text"):
+                    final_text += block.text
+            return final_text
+
+        elif response.stop_reason == "tool_use":
+            # Claude wants to use tools
+            # Add Claude's response (with tool calls) to messages
+            messages.append({"role": "assistant", "content": response.content})
+
+            # Execute all requested tools
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    result = execute_tool(block.name, block.input, chat_id)
+                    tool_results.append({
+                        "type":        "tool_result",
+                        "tool_use_id": block.id,
+                        "content":     json.dumps(result)
+                    })
+
+            # Add tool results to messages
+            messages.append({"role": "user", "content": tool_results})
+
+        else:
+            # Unexpected stop reason
+            break
+
+    return "I ran into an issue processing that request. Please try again."
+
+# ── Daily Business Lesson ─────────────────────────────────────────────────────
 CONCEPTS = [
     "opportunity cost","cash flow","gross margin","EBITDA","working capital",
     "accounts receivable","break even point","return on investment",
@@ -303,133 +547,18 @@ def get_daily_lesson():
     )
     return "Today's Business Lesson: " + concept.title() + "\n\n" + resp.content[0].text
 
-# ── Build Context for Claude ─────────────────────────────────────────────────
-def build_context(text):
-    text_l  = text.lower()
-    context = ""
-
-    # Always fetch accounting data
-    try:
-        summary  = get_accounting_summary()
-        invoices = get_all_invoices(20)
-        if summary.get("status") == "ok":
-            inv_lines = []
-            for inv in invoices[-10:]:
-                inv_lines.append(
-                    str(inv.get("ID","")) + "|" + str(inv.get("Date Received","")) + "|" +
-                    str(inv.get("Vendor","")) + "|" + str(inv.get("Category","")) + "|TTD " +
-                    str(inv.get("Total",0)) + "|" + str(inv.get("Status",""))
-                )
-            context += (
-                "\n\n[ACCOUNTING] " +
-                "Total invoices: " + str(summary.get("total_invoices",0)) +
-                ", This week: TTD " + str(round(summary.get("total_spend_this_week",0),2)) +
-                ", This month: TTD " + str(round(summary.get("total_spend_this_month",0),2)) +
-                "\nRecent invoices: " + " || ".join(inv_lines)
-            )
-    except Exception as e:
-        context += "\n[ACCOUNTING] Unavailable: " + str(e)[:50]
-
-    # Fetch emails — always, for any question
-    try:
-        # Build smart query — check current message AND conversation history
-        q = "in:inbox newer_than:7d"
-        skip = {"what","is","my","the","from","have","any","did","get","for","that","this",
-                "your","can","you","see","email","inbox","mail","about","were","there",
-                "emails","messages","yesterday","today","week","please","most","recent",
-                "latest","only","just","okay","yes","no","sure","want","need","have","got"}
-
-        search_term = ""
-        # Try current message first
-        for word in text.split():
-            w = word.strip("?.,!").lower()
-            if len(w) > 3 and w not in skip:
-                search_term = word.strip("?.,!")
-                break
-
-        # If message is vague (follow-up like "most recent please"), use history
-        if not search_term or len(text.strip("?! ")) < 20:
-            hist = get_history(chat_id)
-            for msg in reversed(hist[-8:]):
-                for word in msg.get("content","").split():
-                    w = word.strip("?.,!").lower()
-                    if len(w) > 3 and w not in skip:
-                        search_term = word.strip("?.,!")
-                        break
-                if search_term:
-                    break
-
-        if "yesterday" in text.lower():
-            q = "in:inbox newer_than:2d older_than:1d"
-        elif "today" in text.lower():
-            q = "in:inbox newer_than:1d"
-        elif "jmmb" in text.lower() or "transaction" in text.lower():
-            q = "from:transactionalerts@jmmb.com newer_than:7d"
-        elif search_term:
-            q = "in:inbox newer_than:14d " + search_term
-
-        emails = search_emails(q, max_results=8)
-        if emails:
-            lines = []
-            for em in emails:
-                sf = em["from"][:35].replace('"',"")
-                ss = em["subject"][:50].replace('"',"")
-                sp = em["snippet"][:80].replace('"',"")
-                lines.append("From:" + sf + " Subj:" + ss + " Preview:" + sp)
-            context += "\n\n[EMAILS] " + " || ".join(lines)
-        else:
-            context += "\n\n[EMAILS] No emails found for that search."
-    except Exception as e:
-        context += "\n\n[EMAILS] Unavailable: " + str(e)[:80]
-
-    # Fetch calendar if relevant
-    cal_kws = ["calendar","schedule","meeting","today","tomorrow","week","event","appointment","reminder","upcoming"]
-    if any(w in text_l for w in cal_kws):
-        try:
-            events = get_events(days_ahead=7)
-            if events:
-                ev_lines = [format_event(e) for e in events[:8]]
-                context += "\n\n[CALENDAR] Upcoming: " + " | ".join(ev_lines)
-            else:
-                context += "\n\n[CALENDAR] No upcoming events."
-        except Exception as e:
-            context += "\n\n[CALENDAR] Unavailable: " + str(e)[:50]
-
-    return context
-
-# ── Telegram Helpers ─────────────────────────────────────────────────────────
-def send_message(chat_id, text, parse_mode=""):
-    # Split long messages
-    if len(text) > 4000:
-        chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-        for chunk in chunks:
-            requests.post(TELEGRAM_API + "/sendMessage",
-                json={"chat_id": chat_id, "text": chunk, "parse_mode": parse_mode})
-            time.sleep(0.3)
-    else:
-        requests.post(TELEGRAM_API + "/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode})
-
-def get_file_url(file_id):
-    r    = requests.get(TELEGRAM_API + "/getFile", params={"file_id": file_id})
-    path = r.json()["result"]["file_path"]
-    return "https://api.telegram.org/file/bot" + TELEGRAM_TOKEN + "/" + path
-
-# ── Morning Briefing ─────────────────────────────────────────────────────────
+# ── Morning Briefing ──────────────────────────────────────────────────────────
 def build_morning_briefing():
     today    = datetime.datetime.utcnow() - datetime.timedelta(hours=4)
     day_str  = today.strftime("%A, %B %d, %Y")
-    hour     = today.hour
-    greeting = "Good morning" if hour < 12 else ("Good afternoon" if hour < 17 else "Good evening")
-    lines    = [greeting + ", " + OWNER_NAME + "!", day_str, ""]
+    lines    = ["Good morning, " + OWNER_NAME + "!", day_str, ""]
 
-    # Calendar
     try:
-        events = get_events(days_ahead=1)
-        if events:
-            lines.append("Todays Schedule (" + str(len(events)) + " events):")
-            for e in events:
-                lines.append("  " + format_event(e))
+        events = tool_get_calendar_events(days_ahead=1)
+        if events.get("events"):
+            lines.append("Today's Schedule:")
+            for e in events["events"]:
+                lines.append("  " + e["title"] + " — " + e["time"])
         else:
             lines.append("Calendar: Nothing scheduled today.")
     except:
@@ -437,61 +566,28 @@ def build_morning_briefing():
 
     lines.append("")
 
-    # Email scan for overnight receipts
     try:
-        receipt_emails = search_emails(
-            "from:(transactionalerts@jmmb.com OR ttrideshare OR noreply) newer_than:1d",
-            max_results=10
-        )
-        if receipt_emails:
-            lines.append("Overnight Receipts (" + str(len(receipt_emails)) + " found):")
-            for em in receipt_emails[:5]:
-                lines.append("  " + em["from"][:30] + " — " + em["subject"][:40])
-        else:
-            lines.append("Receipts: None overnight.")
-    except:
-        lines.append("Receipts: unavailable")
-
-    lines.append("")
-
-    # Accounting summary
-    try:
-        summary = get_accounting_summary()
-        if summary.get("status") == "ok":
+        data = tool_get_accounting_data()
+        s    = data.get("summary",{})
+        if s.get("status") == "ok":
             lines.append("Expenses:")
-            lines.append("  This week: TTD " + str(round(summary.get("total_spend_this_week",0),2)))
-            lines.append("  This month: TTD " + str(round(summary.get("total_spend_this_month",0),2)))
-            lines.append("  Pending: " + str(summary.get("pending_invoices",0)) + " invoices")
+            lines.append("  This week: TTD " + str(round(s.get("total_spend_this_week",0),2)))
+            lines.append("  This month: TTD " + str(round(s.get("total_spend_this_month",0),2)))
     except:
         lines.append("Expenses: unavailable")
 
     lines.append("")
 
-    # Upcoming events next 3 days
-    try:
-        upcoming = get_events(days_ahead=3)
-        future   = [e for e in upcoming if e.get("start",{}).get("dateTime","") > datetime.datetime.utcnow().isoformat()]
-        if future:
-            lines.append("Coming Up (next 3 days):")
-            for e in future[:3]:
-                lines.append("  " + format_event(e))
-    except:
-        pass
-
-    lines.append("")
-    lines.append("---")
-
-    # Daily lesson
     try:
         lines.append(get_daily_lesson())
     except:
         pass
 
     lines.append("")
-    lines.append("Type /help for all commands")
+    lines.append("Type anything to get started. I'm here!")
     return "\n".join(lines)
 
-# ── Schedulers ───────────────────────────────────────────────────────────────
+# ── Schedulers ────────────────────────────────────────────────────────────────
 def morning_scheduler():
     last_sent = None
     while True:
@@ -502,38 +598,47 @@ def morning_scheduler():
                 briefing = build_morning_briefing()
                 send_message(OWNER_CHAT_ID, briefing)
                 last_sent = date
-                print("Morning briefing sent at " + str(now))
             except Exception as e:
                 print("Briefing error: " + str(e))
         time.sleep(60)
 
 def event_reminder_scheduler():
-    """Check for events starting in 30 minutes and send reminders."""
     while True:
         try:
             if OWNER_CHAT_ID:
-                now      = datetime.datetime.utcnow()
-                soon     = now + datetime.timedelta(minutes=35)
-                events   = get_events(days_ahead=0)
-                for event in events:
-                    start_str = event.get("start",{}).get("dateTime","")
-                    if not start_str:
-                        continue
+                events = tool_get_calendar_events(days_ahead=0)
+                now    = datetime.datetime.utcnow()
+                for e in events.get("events", []):
+                    time_str = e.get("time","")
                     try:
-                        start_dt = datetime.datetime.fromisoformat(start_str.replace("Z",""))
-                        diff     = (start_dt - now).total_seconds() / 60
+                        dt   = datetime.datetime.strptime(time_str, "%A, %B %d at %I:%M %p")
+                        dt   = dt.replace(year=now.year)
+                        diff = (dt - (now - datetime.timedelta(hours=4))).total_seconds() / 60
                         if 25 <= diff <= 35:
                             send_message(OWNER_CHAT_ID,
-                                "Reminder: " + event.get("summary","Event") +
-                                " starts in 30 minutes!"
-                            )
+                                "Reminder: " + e["title"] + " starts in 30 minutes!")
                     except:
                         pass
         except:
             pass
-        time.sleep(300)  # check every 5 minutes
+        time.sleep(300)
 
-# ── Main Webhook ─────────────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
+def send_message(chat_id, text, parse_mode=""):
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            requests.post(TELEGRAM_API + "/sendMessage",
+                json={"chat_id": chat_id, "text": text[i:i+4000]})
+            time.sleep(0.3)
+    else:
+        requests.post(TELEGRAM_API + "/sendMessage",
+            json={"chat_id": chat_id, "text": text})
+
+def get_file_url(file_id):
+    r    = requests.get(TELEGRAM_API + "/getFile", params={"file_id": file_id})
+    path = r.json()["result"]["file_path"]
+    return "https://api.telegram.org/file/bot" + TELEGRAM_TOKEN + "/" + path
+
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
     update  = request.json
@@ -541,7 +646,7 @@ def telegram_webhook():
         return "ok"
     msg     = update.get("message", {})
     chat_id = msg.get("chat", {}).get("id")
-    text    = msg.get("text", "").strip()
+    text    = msg.get("text","").strip()
     text_l  = text.lower()
     photo   = msg.get("photo")
     document= msg.get("document")
@@ -549,320 +654,103 @@ def telegram_webhook():
     if not chat_id:
         return "ok"
 
-    try:
+    # Handle /start and /help
+    if text_l in ("/start","/help","help"):
+        send_message(chat_id,
+            "Hey " + OWNER_NAME + "! I'm Primo, your personal business assistant.\n\n"
+            "Just talk to me naturally. I can:\n\n"
+            "- Read and search your emails\n"
+            "- Find and send you file attachments\n"
+            "- Check and update your calendar\n"
+            "- Track your expenses and invoices\n"
+            "- Send emails on your behalf\n"
+            "- Search the web\n"
+            "- Give you a daily briefing\n\n"
+            "No special commands needed — just tell me what you need!"
+        )
+        return "ok"
 
-        # ── /start or /help ───────────────────────────────────────────────
-        if text_l in ("/start","/help","help"):
-            send_message(chat_id,
-                "Hey " + OWNER_NAME + "! I'm Primo, your personal business assistant.\n\n"
-                "I can help you with:\n\n"
-                "EMAILS\n"
-                "- Read and search your inbox\n"
-                "- Find and send you attachments\n"
-                "- Send emails on your behalf\n\n"
-                "CALENDAR\n"
-                "- Check your schedule\n"
-                "- Create events\n"
-                "- 30-min reminders before events\n\n"
-                "ACCOUNTING\n"
-                "- Invoice and expense queries\n"
-                "- Spending summaries\n\n"
-                "DAILY BRIEFING\n"
-                "- Sent every morning at 8am\n"
-                "- Or type /briefing anytime\n\n"
-                "Just talk to me naturally — I understand plain English!\n\n"
-                "Commands: /briefing /emails /today /week /help /clearmemory"
-            )
-            return "ok"
+    if text_l in ("/clearmemory","forget","clear memory"):
+        clear_history(chat_id)
+        send_message(chat_id, "Memory cleared! Fresh start.")
+        return "ok"
 
-        # ── Clear conversation memory ─────────────────────────────────────
-        if text_l in ("/clearmemory","clear memory","forget","start over","new conversation"):
-            clear_history(chat_id)
-            send_message(chat_id, "Memory cleared! Starting fresh.")
-            return "ok"
+    if text_l in ("/briefing","briefing","good morning","morning update"):
+        def send_briefing():
+            send_message(chat_id, build_morning_briefing())
+        threading.Thread(target=send_briefing, daemon=True).start()
+        return "ok"
 
-        # ── Morning briefing ──────────────────────────────────────────────
-        if text_l in ("/briefing","briefing","morning","good morning","daily update","update"):
-            send_message(chat_id, "Getting your briefing...")
-            def send_briefing():
-                briefing = build_morning_briefing()
-                send_message(chat_id, briefing)
-            threading.Thread(target=send_briefing, daemon=True).start()
-            return "ok"
-
-        # ── Calendar: today ───────────────────────────────────────────────
-        if text_l in ("/today","today","whats today","what's today","schedule today"):
-            events = get_events(days_ahead=1)
-            if not events:
-                send_message(chat_id, "Nothing on your calendar today — free day!")
-            else:
-                lines = [datetime.date.today().strftime("%A, %B %d") + "\n"]
-                for e in events:
-                    lines.append(format_event(e))
-                send_message(chat_id, "\n".join(lines))
-            return "ok"
-
-        # ── Calendar: week ────────────────────────────────────────────────
-        if text_l in ("/week","this week","weekly schedule","week ahead"):
-            events = get_events(days_ahead=7)
-            if not events:
-                send_message(chat_id, "Nothing in your calendar this week!")
-            else:
-                lines = ["This Week\n"]
-                for e in events[:10]:
-                    lines.append(format_event(e))
-                send_message(chat_id, "\n".join(lines))
-            return "ok"
-
-        # ── Emails ────────────────────────────────────────────────────────
-        if text_l in ("/emails","emails","check email","inbox","unread","new emails"):
-            def fetch_emails():
-                try:
-                    emails = search_emails("in:inbox is:unread newer_than:3d", max_results=8)
-                    if not emails:
-                        send_message(chat_id, "Your inbox is clear — no unread emails!")
-                        return
-                    lines = [str(len(emails)) + " unread emails:\n"]
-                    for i, em in enumerate(emails, 1):
-                        lines.append(str(i) + ". " + em["subject"][:50])
-                        lines.append("   From: " + em["from"][:40])
-                        lines.append("   " + em["snippet"][:80])
-                        lines.append("")
-                    send_message(chat_id, "\n".join(lines))
-                except Exception as e:
-                    send_message(chat_id, "Email error: " + str(e)[:100])
-            send_message(chat_id, "Checking your inbox...")
-            threading.Thread(target=fetch_emails, daemon=True).start()
-            return "ok"
-
-        # ── Attachment request ────────────────────────────────────────────
-        attach_kws = ["attachment","pdf","document","report","file","spreadsheet","send me","get the","retrieve","download","grab"]
-        if any(w in text_l for w in attach_kws):
-            def fetch_attachments():
-                try:
-                    skip = {"attachment","file","pdf","document","report","email","please","from",
-                            "with","the","and","get","pull","grab","retrieve","download","send","me",
-                            "my","can","you","have","that","this","is","in","there","any"}
-                    hint = ""
-                    for word in text.split():
-                        w = word.strip("?.,!").lower()
-                        if len(w) > 3 and w not in skip:
-                            hint = word.strip("?.,!")
-                            break
-
-                    q = "in:inbox has:attachment newer_than:14d"
-                    if hint:
-                        q += " " + hint
-
-                    send_message(chat_id, "Searching for attachments" + (" matching '" + hint + "'" if hint else "") + "...")
-                    emails = search_emails(q, max_results=5)
-
-                    if not emails:
-                        send_message(chat_id, "No emails with attachments found" + (" for '" + hint + "'" if hint else "") + ".")
-                        return
-
-                    svc        = get_gmail()
-                    files_sent = 0
-                    for em in emails[:3]:
-                        body, atts = get_email_body_and_attachments(em["id"])
-                        if atts:
-                            send_message(chat_id,
-                                "Found in: " + em["subject"][:50] +
-                                "\nFrom: " + em["from"][:40] +
-                                "\nSending " + str(len(atts)) + " file(s)..."
-                            )
-                            for att in atts[:3]:
-                                if att.get("attachment_id"):
-                                    ok = download_and_send_attachment(
-                                        chat_id, em["id"],
-                                        att["attachment_id"],
-                                        att["filename"],
-                                        "From: " + em["from"][:30]
-                                    )
-                                    if ok:
-                                        files_sent += 1
-
-                    if files_sent == 0:
-                        send_message(chat_id, "Found emails but couldn't download the files. Try asking the sender to resend.")
-                    else:
-                        send_message(chat_id, "Sent " + str(files_sent) + " file(s) to you!")
-                except Exception as e:
-                    send_message(chat_id, "Error fetching attachment: " + str(e)[:100])
-
-            threading.Thread(target=fetch_attachments, daemon=True).start()
-            return "ok"
-
-        # ── Scan emails for receipts ──────────────────────────────────────
-        scan_kws = ["scan emails","check emails for receipts","scan for receipts","find receipts","scan inbox","/scanemails"]
-        if any(p in text_l for p in scan_kws):
-            days = 10
-            for word in text_l.split():
-                if word.isdigit():
-                    days = int(word)
-                    break
-            send_message(chat_id, "Scanning emails for receipts from the last " + str(days) + " days...")
-            def do_scan():
-                try:
-                    q = (
-                        "in:inbox newer_than:" + str(days) + "d "
-                        "(from:transactionalerts@jmmb.com OR from:ttrideshare OR "
-                        "subject:receipt OR subject:invoice OR subject:payment OR "
-                        "subject:transaction OR subject:summary OR subject:confirmation)"
-                    )
-                    emails = search_emails(q, max_results=20)
-                    if not emails:
-                        send_message(chat_id, "No receipts found in the last " + str(days) + " days.")
-                        return
-                    logged = []
-                    for em in emails:
-                        body, _ = get_email_body_and_attachments(em["id"])
-                        prompt  = (
-                            "Extract receipt/invoice data from: "
-                            "From:" + em["from"] + " Subject:" + em["subject"] +
-                            " Body:" + body[:1500] +
-                            " Return JSON: {vendor,invoice_date,invoice_number,description,category,currency,amount,tax,confidence} "
-                            "or SKIP if not a receipt. Currency should be TTD for local, USD for international."
-                        )
-                        resp = claude.messages.create(
-                            model="claude-sonnet-4-5", max_tokens=300,
-                            messages=[{"role":"user","content": prompt}]
-                        )
-                        raw = resp.content[0].text.strip()
-                        if raw.upper().startswith("SKIP"):
-                            continue
-                        if raw.startswith("```"):
-                            raw = raw.split("```")[1]
-                            if raw.startswith("json"):
-                                raw = raw[4:]
-                        try:
-                            data   = json.loads(raw)
-                            inv_id = log_invoice_to_sheet(data, "email_scan")
-                            if inv_id:
-                                logged.append(inv_id + " | " + data.get("vendor","?") + " | " + str(data.get("currency","TTD")) + " " + str(data.get("amount",0)))
-                        except:
-                            pass
-                    if logged:
-                        send_message(chat_id, "Logged " + str(len(logged)) + " receipt(s):\n" + "\n".join(logged) + "\n\nAll added to your Google Sheet!")
-                    else:
-                        send_message(chat_id, "Scanned " + str(len(emails)) + " emails but no parseable receipts found.")
-                except Exception as e:
-                    send_message(chat_id, "Scan error: " + str(e)[:100])
-            threading.Thread(target=do_scan, daemon=True).start()
-            return "ok"
-
-        # ── Clear accounting sheet ────────────────────────────────────────
-        clear_kws = ["clear the sheet","clear sheet","delete all invoices","delete all entries",
-                     "start fresh","wipe the sheet","reset the sheet","clear all data"]
-        if any(p in text_l for p in clear_kws):
-            if ACCOUNTING_API_URL:
-                r    = requests.post(ACCOUNTING_API_URL + "/api/clearsheet", timeout=15)
-                data = r.json()
-                if data.get("status") == "ok":
-                    send_message(chat_id, "All sheets cleared! Next invoice will be INV-001.")
-                else:
-                    send_message(chat_id, "Error: " + data.get("message","unknown"))
-            return "ok"
-
-        # ── Web search ────────────────────────────────────────────────────
-        if text_l.startswith("/search") or "search for" in text_l or "look up" in text_l:
-            query = text.replace("/search","").replace("search for","").replace("look up","").strip()
-            def do_search():
-                result = web_search(query)
-                resp   = claude.messages.create(
-                    model="claude-sonnet-4-5", max_tokens=300,
-                    messages=[{"role":"user","content":
-                        "User searched: " + query + ". Results: " + result + ". Summarise in 3-5 sentences."
-                    }]
-                )
-                send_message(chat_id, resp.content[0].text)
-            send_message(chat_id, "Searching for: " + query + "...")
-            threading.Thread(target=do_search, daemon=True).start()
-            return "ok"
-
-        # ── Photo/document received ───────────────────────────────────────
-        if photo or (document and document.get("mime_type","").startswith("image")):
-            caption = msg.get("caption","").lower()
-            send_message(chat_id, "Got it! Reading your invoice...")
-            def process_image():
-                try:
-                    file_id   = photo[-1]["file_id"] if photo else document["file_id"]
-                    file_url  = get_file_url(file_id)
-                    img_data  = requests.get(file_url).content
-                    image_b64 = base64.standard_b64encode(img_data).decode("utf-8")
-                    resp = claude.messages.create(
-                        model="claude-sonnet-4-5", max_tokens=400,
-                        messages=[{"role":"user","content":[
-                            {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":image_b64}},
-                            {"type":"text","text":
-                                "Extract invoice data. Return JSON: "
-                                "{vendor,invoice_date,invoice_number,description,category,currency,amount,tax,confidence}. "
-                                "Category options: Office Supplies|Software/Cloud|Shipping|Facilities|Marketing|Travel|Utilities|Professional Services|Food & Entertainment|Other. "
-                                "Default currency TTD."}
-                        ]}]
-                    )
-                    raw = resp.content[0].text.strip()
-                    if raw.startswith("```"):
-                        raw = raw.split("```")[1]
-                        if raw.startswith("json"): raw = raw[4:]
-                    data   = json.loads(raw)
-                    inv_id = log_invoice_to_sheet(data, "telegram_photo")
-                    amount = float(data.get("amount",0))
-                    tax    = float(data.get("tax",0))
-                    send_message(chat_id,
-                        "Invoice Logged!\n\n"
-                        "ID: " + str(inv_id) + "\n"
-                        "Vendor: " + data.get("vendor","Unknown") + "\n"
-                        "Date: " + data.get("invoice_date","N/A") + "\n"
-                        "Category: " + data.get("category","Other") + "\n"
-                        "Amount: " + data.get("currency","TTD") + " " + str(amount) + "\n"
-                        "Tax: " + data.get("currency","TTD") + " " + str(tax) + "\n"
-                        "Total: " + data.get("currency","TTD") + " " + str(round(amount+tax,2)) + "\n"
-                        "Sheet updated!"
-                    )
-                except Exception as e:
-                    send_message(chat_id, "Error processing image: " + str(e)[:100])
-            threading.Thread(target=process_image, daemon=True).start()
-            return "ok"
-
-        # ── Natural language handler ──────────────────────────────────────
-        # Run in background thread to avoid Telegram timeout
-        def handle_natural_language():
+    # Handle photo/document upload
+    if photo or (document and document.get("mime_type","").startswith("image")):
+        def process_image():
             try:
-                context = build_context(text)
-                history = get_history(chat_id)
-                full_msg = text + context
-
-                response = claude.messages.create(
-                    model="claude-sonnet-4-5",
-                    max_tokens=600,
-                    system=SYSTEM_PROMPT,
-                    messages=history + [{"role": "user", "content": full_msg}]
+                send_message(chat_id, "Got it — reading this invoice...")
+                file_id   = photo[-1]["file_id"] if photo else document["file_id"]
+                file_url  = get_file_url(file_id)
+                img_data  = requests.get(file_url).content
+                image_b64 = base64.standard_b64encode(img_data).decode("utf-8")
+                resp = claude.messages.create(
+                    model="claude-sonnet-4-5", max_tokens=400,
+                    messages=[{"role":"user","content":[
+                        {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":image_b64}},
+                        {"type":"text","text":
+                            "Extract invoice data and return ONLY valid JSON: "
+                            "{vendor,invoice_date,invoice_number,description,category,currency,amount,tax,confidence}. "
+                            "Categories: Office Supplies|Software/Cloud|Shipping|Facilities|Marketing|Travel|Utilities|Professional Services|Food & Entertainment|Other. "
+                            "Default currency TTD."}
+                    ]}]
                 )
-                reply = response.content[0].text
+                raw = resp.content[0].text.strip()
+                if raw.startswith("```"):
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"): raw = raw[4:]
+                data = json.loads(raw)
+                if ACCOUNTING_API_URL:
+                    r      = requests.post(ACCOUNTING_API_URL + "/api/log_invoice",
+                                           json={"data": data, "source": "telegram_photo"}, timeout=15)
+                    inv_id = r.json().get("inv_id","?")
+                else:
+                    inv_id = "N/A"
+                amount = float(data.get("amount",0))
+                tax    = float(data.get("tax",0))
+                send_message(chat_id,
+                    "Logged!\n\n"
+                    "ID: " + str(inv_id) + "\n"
+                    "Vendor: " + data.get("vendor","?") + "\n"
+                    "Date: " + data.get("invoice_date","?") + "\n"
+                    "Category: " + data.get("category","Other") + "\n"
+                    "Amount: " + data.get("currency","TTD") + " " + str(amount) + "\n"
+                    "Tax: " + data.get("currency","TTD") + " " + str(tax) + "\n"
+                    "Total: " + data.get("currency","TTD") + " " + str(round(amount+tax,2))
+                )
+            except Exception as e:
+                send_message(chat_id, "Error reading invoice: " + str(e)[:100])
+        threading.Thread(target=process_image, daemon=True).start()
+        return "ok"
+
+    # All other messages — run through the agent
+    if text:
+        def run_in_background():
+            try:
+                reply = run_agent(chat_id, text)
                 add_to_history(chat_id, "user", text)
                 add_to_history(chat_id, "assistant", reply)
                 send_message(chat_id, reply)
             except Exception as e:
                 traceback.print_exc()
-                send_message(chat_id, "Error: " + str(e)[:100])
-
-        threading.Thread(target=handle_natural_language, daemon=True).start()
-
-    except Exception as e:
-        traceback.print_exc()
-        send_message(chat_id, "Something went wrong: " + str(e)[:100] + "\n\nTry /help")
+                send_message(chat_id, "Something went wrong: " + str(e)[:100])
+        threading.Thread(target=run_in_background, daemon=True).start()
 
     return "ok"
 
-# ── Health Check ─────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return {"status":"ok","bot":"Primo Assistant","time":str(datetime.datetime.now())}
+    return {"status":"ok","bot":"Primo v2","time":str(datetime.datetime.now())}
 
-# ── Start Background Schedulers ───────────────────────────────────────────────
 threading.Thread(target=morning_scheduler,        daemon=True).start()
 threading.Thread(target=event_reminder_scheduler, daemon=True).start()
 
 if __name__ == "__main__":
-    print("Primo Assistant starting on http://localhost:5002")
+    print("Primo v2 starting on http://localhost:5002")
     app.run(host="0.0.0.0", port=5002, debug=False)
