@@ -189,15 +189,22 @@ def tool_read_email(email_id):
 def tool_send_attachment_to_telegram(chat_id, email_id, attachment_id, filename):
     """Download email attachment and send to Telegram."""
     try:
-        svc        = get_gmail()
-        att        = svc.users().messages().attachments().get(
+        svc  = get_gmail()
+        att  = svc.users().messages().attachments().get(
             userId="me", messageId=email_id, id=attachment_id
         ).execute()
-        file_data  = att.get("data","")
-        file_bytes = base64.urlsafe_b64decode(file_data + "==")
-        files      = {"document": (filename, io.BytesIO(file_bytes))}
-        data       = {"chat_id": chat_id}
-        r          = requests.post(TELEGRAM_API + "/sendDocument", data=data, files=files, timeout=30)
+        raw_data = att.get("data","")
+        if not raw_data:
+            return {"success": False, "error": "No attachment data returned"}
+        # Fix base64 padding
+        raw_data   = raw_data.replace("-","+").replace("_","/")
+        padding    = 4 - len(raw_data) % 4
+        if padding != 4:
+            raw_data += "=" * padding
+        file_bytes = base64.b64decode(raw_data)
+        files      = {"document": (filename, io.BytesIO(file_bytes), "application/octet-stream")}
+        data       = {"chat_id": str(chat_id)}
+        r          = requests.post(TELEGRAM_API + "/sendDocument", data=data, files=files, timeout=60)
         result     = r.json()
         if result.get("ok"):
             return {"success": True, "message": "Sent " + filename + " to Telegram"}
