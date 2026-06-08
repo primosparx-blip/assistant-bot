@@ -136,10 +136,20 @@ def get_email_body_and_attachments(msg_id):
     payload = detail.get("payload", {})
 
     def extract_text(part):
+        # Try plain text first
         if part.get("mimeType") == "text/plain":
             data = part.get("body", {}).get("data", "")
             if data:
                 return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+        # Fall back to HTML and strip tags
+        if part.get("mimeType") == "text/html":
+            data = part.get("body", {}).get("data", "")
+            if data:
+                html = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                import re
+                text = re.sub(r"<[^>]+>", " ", html)
+                text = re.sub(r"\s+", " ", text).strip()
+                return text[:3000]
         for sub in part.get("parts", []):
             result = extract_text(sub)
             if result:
