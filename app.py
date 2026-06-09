@@ -196,18 +196,32 @@ def tool_send_attachment_to_telegram(chat_id, email_id, attachment_id, filename)
         raw_data = att.get("data","")
         if not raw_data:
             return {"success": False, "error": "No attachment data returned"}
-        # Fix base64 padding
+        # Fix base64url encoding
         raw_data   = raw_data.replace("-","+").replace("_","/")
-        padding    = 4 - len(raw_data) % 4
-        if padding != 4:
-            raw_data += "=" * padding
+        padding    = (4 - len(raw_data) % 4) % 4
+        raw_data  += "=" * padding
         file_bytes = base64.b64decode(raw_data)
-        files      = {"document": (filename, io.BytesIO(file_bytes), "application/octet-stream")}
-        data       = {"chat_id": str(chat_id)}
-        r          = requests.post(TELEGRAM_API + "/sendDocument", data=data, files=files, timeout=60)
-        result     = r.json()
+        file_size  = len(file_bytes)
+        print(f"Sending {filename} ({file_size} bytes) to Telegram")
+
+        # Choose method based on file type
+        mime = "image/jpeg" if filename.lower().endswith((".jpg",".jpeg")) else "application/octet-stream"
+        endpoint = "/sendPhoto" if mime == "image/jpeg" else "/sendDocument"
+        field    = "photo" if mime == "image/jpeg" else "document"
+
+        files = {field: (filename, io.BytesIO(file_bytes), mime)}
+        data  = {"chat_id": str(chat_id), "caption": filename}
+        r     = requests.post(TELEGRAM_API + endpoint, data=data, files=files, timeout=120)
+        result = r.json()
         if result.get("ok"):
             return {"success": True, "message": "Sent " + filename + " to Telegram"}
+        # If photo fails, try as document
+        if field == "photo":
+            files2 = {"document": (filename, io.BytesIO(file_bytes), "image/jpeg")}
+            r2     = requests.post(TELEGRAM_API + "/sendDocument", data={"chat_id": str(chat_id)}, files=files2, timeout=120)
+            result2 = r2.json()
+            if result2.get("ok"):
+                return {"success": True, "message": "Sent " + filename + " to Telegram"}
         return {"success": False, "error": str(result)}
     except Exception as e:
         return {"success": False, "error": str(e)}
