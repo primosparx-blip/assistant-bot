@@ -481,7 +481,7 @@ def run_agent(chat_id, user_message):
     history  = get_history(chat_id)
     messages = history + [{"role": "user", "content": user_message}]
 
-    max_iterations = 8
+    max_iterations = 15
     iterations     = 0
 
     while iterations < max_iterations:
